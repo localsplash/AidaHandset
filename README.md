@@ -4,7 +4,7 @@ Provide the Grandstream GXV3450 data-and-control interface.
 
 ## Responsibilities
 
-- Pair to one HostedPulse extension using a one-time code
+- Pair to one OfficePulse extension using a one-time code
 - Receive private Pusher call notifications
 - Fetch authorized call details and a data-only LiveKit token
 - Display simultaneous calls and live transcripts
