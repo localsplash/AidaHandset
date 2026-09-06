@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Aida Handset</string>
+    <string name="default_server_url">https://officepulse.localsplash.dev</string>
+</resources>
