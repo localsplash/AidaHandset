@@ -25,7 +25,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 The debug APK is for local POC testing. Configure your own signing key for a distributable release; signing keys must stay outside Git. CI produces the debug APK as a workflow artifact.
 
-Open the app and enter the HTTPS **OfficePulse origin**, such as `https://officepulse.localsplash.dev`, followed by a one-time enrollment code created for the desired business extension in Aida Admin. Nginx Proxy Manager must forward that origin to OfficePulse and serve a certificate the Android device trusts. There is no web container to deploy for this Android app.
+Open the app and enter the HTTPS **OfficePulse public API origin**, defaulting to `https://aida-api.localsplash.dev`, followed by a one-time enrollment code created for the desired business extension in Aida Admin. In the development composition, Nginx Proxy Manager forwards this origin to host port `18085` (OfficePulse's public listener on container port `8086`) and serves a certificate the Android device trusts. The private provisioning listener on `8085` stays inside the Docker network. There is no web container to deploy for this Android app.
 
 The app uses the server's assigned tenant and extension. It has no tenant override or SUPER ADMIN mode; central Identity manages the humans using Aida Admin, and OfficePulse authorizes the resulting scoped device token. Revoke enrolled devices in Aida Admin. Local Unpair removes the local encrypted session but does not revoke the server token.
 

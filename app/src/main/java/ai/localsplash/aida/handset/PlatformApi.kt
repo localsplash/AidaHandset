@@ -68,7 +68,7 @@ class PlatformApi(
                 "Use an HTTPS OfficePulse server URL with a trusted certificate."
             }
             require(url.username.isEmpty() && url.password.isEmpty() && url.query == null && url.fragment == null && url.encodedPath == "/") {
-                "Enter only the server origin, for example https://officepulse.localsplash.dev."
+                "Enter only the server origin, for example https://aida-api.localsplash.dev."
             }
             return url
         }
