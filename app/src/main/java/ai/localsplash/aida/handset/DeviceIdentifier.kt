@@ -28,8 +28,8 @@ object DeviceIdentifier {
                 if (intf.isLoopback) continue
                 val mac = intf.hardwareAddress ?: continue
                 if (mac.isNotEmpty()) {
-                    val hex = mac.joinToString("") { "%02x".format(it) }
-                    if (hex != "020000000000") return hex
+                    val hex = mac.joinToString(":") { "%02x".format(it).lowercase() }
+                    if (hex != "02:00:00:00:00:00" && hex.isNotBlank()) return hex
                 }
             }
         } catch (_: Exception) {}

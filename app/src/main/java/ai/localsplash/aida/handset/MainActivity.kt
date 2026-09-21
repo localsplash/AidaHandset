@@ -171,7 +171,8 @@ class MainActivity : Activity() {
                         appInstanceId = store.appInstanceId,
                         localIps = localIps,
                         deviceModel = deviceModel,
-                        claimedMac = claimedMac,
+                        appVersion = BuildConfig.VERSION_NAME,
+                        claimedMac = claimedMac?.takeIf { it.isNotBlank() },
                     )
                 )
                 val newSession = DeviceSession(

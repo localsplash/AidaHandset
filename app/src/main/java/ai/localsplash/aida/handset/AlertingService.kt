@@ -177,7 +177,8 @@ class AlertingService : Service() {
                     appInstanceId = store.appInstanceId,
                     localIps = localIps,
                     deviceModel = DeviceIdentifier.getDeviceModel(),
-                    claimedMac = DeviceIdentifier.getClaimedMac(),
+                    appVersion = BuildConfig.VERSION_NAME,
+                    claimedMac = DeviceIdentifier.getClaimedMac()?.takeIf { it.isNotBlank() },
                 )
             )
             store.save(

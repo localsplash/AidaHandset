@@ -27,7 +27,8 @@ class PlatformApiTest {
                 appInstanceId = "app-123",
                 localIps = listOf("192.168.6.97"),
                 deviceModel = "Grandstream GXV3450",
-                claimedMac = "ec74d7c92718",
+                appVersion = "0.1.0",
+                claimedMac = "ec:74:d7:c9:27:18",
             )
         )
         assertEquals("device-secret", attachResp.token)
@@ -41,7 +42,30 @@ class PlatformApiTest {
         val body = PlatformApi.json.parseToJsonElement(request.body.readUtf8()).jsonObject
         assertEquals("app-123", body["appInstanceId"]!!.jsonPrimitive.content)
         assertEquals("Grandstream GXV3450", body["deviceModel"]!!.jsonPrimitive.content)
-        assertEquals("ec74d7c92718", body["claimedMac"]!!.jsonPrimitive.content)
+        assertEquals("0.1.0", body["appVersion"]!!.jsonPrimitive.content)
+        assertEquals("ec:74:d7:c9:27:18", body["claimedMac"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun attachOmitsClaimedMacWhenNullOrEmpty() = runBlocking {
+        server.enqueue(
+            MockResponse().setBody(
+                """{"token":"device-secret","expiresAt":"2026-09-21T12:00:00Z","device":{"id":"dev-1","pbxInstanceId":"pbx-1","context":"localsplash","endpointId":"411","extension":"411"}}"""
+            )
+        )
+        api().attach(
+            AttachRequest(
+                appInstanceId = "app-123",
+                localIps = listOf("192.168.6.97"),
+                deviceModel = "Grandstream GXV3450",
+                appVersion = "0.1.0",
+                claimedMac = null,
+            )
+        )
+        val request = server.takeRequest()
+        val rawBody = request.body.readUtf8()
+        val body = PlatformApi.json.parseToJsonElement(rawBody).jsonObject
+        assertFalse("claimedMac must be omitted from JSON when null", body.containsKey("claimedMac"))
+        assertEquals("0.1.0", body["appVersion"]!!.jsonPrimitive.content)
     }
 
     @Test fun attachNotRecognizedCarriesDiagnosticAddresses() = runBlocking {

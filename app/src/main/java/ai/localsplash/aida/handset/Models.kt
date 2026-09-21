@@ -7,9 +7,13 @@ data class AttachRequest(
     val appInstanceId: String,
     val localIps: List<String>,
     val deviceModel: String,
-    val appVersion: String = "1.0.0",
+    val appVersion: String = BuildConfig.VERSION_NAME,
     val claimedMac: String? = null,
-)
+) {
+    fun normalized(): AttachRequest = copy(
+        claimedMac = claimedMac?.trim()?.lowercase()?.ifEmpty { null }
+    )
+}
 
 @Serializable
 data class Device(

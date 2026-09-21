@@ -41,7 +41,7 @@ class PlatformApi(
     private val base: HttpUrl = validateServer(serverUrl, allowLocalTestHttp)
 
     suspend fun attach(request: AttachRequest): AttachResponse =
-        json.decodeFromString(request(listOf("handset", "attach"), method = "POST", body = json.encodeToString(request), useToken = false))
+        json.decodeFromString(request(listOf("handset", "attach"), method = "POST", body = json.encodeToString(request.normalized()), useToken = false))
 
     suspend fun me(): HandsetMeResponse =
         json.decodeFromString(request(listOf("handset", "me"), method = "GET"))
@@ -90,7 +90,7 @@ class PlatformApi(
     }
 
     companion object {
-        val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+        val json = Json { ignoreUnknownKeys = true; encodeDefaults = true; explicitNulls = false }
         private val defaultClient = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS)
             .callTimeout(20, TimeUnit.SECONDS)
