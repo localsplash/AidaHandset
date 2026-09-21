@@ -7,8 +7,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Typeface
 import android.os.Build
 import android.os.IBinder
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
+import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
 import com.pusher.client.Pusher
 import com.pusher.client.PusherOptions
@@ -156,6 +162,10 @@ class AlertingService : Service() {
         return try {
             val list = api.calls()
             activeCalls.value = list
+            if (list.none { it.state == "screening" }) {
+                val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                manager?.cancel(NOTIFICATION_ID_CALL_ALERT)
+            }
             list
         } catch (e: ApiException) {
             if (e.status == 401 || e.status == 403) {
@@ -227,8 +237,20 @@ class AlertingService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
+        val remoteViews = RemoteViews(packageName, R.layout.notification_call_alert).apply {
+            setTextViewText(R.id.notif_title, "Incoming Aida Call: $caller")
+            setTextViewText(R.id.notif_text, "Screening · Tap banner to view transcript")
+            setOnClickPendingIntent(R.id.notif_root, fullScreenPendingIntent)
+            setOnClickPendingIntent(R.id.notif_takeover_btn, takeoverPendingIntent)
+        }
+
+        val actionTitle = SpannableString("Take Over").apply {
+            setSpan(ForegroundColorSpan(android.graphics.Color.rgb(46, 125, 50)), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(StyleSpan(Typeface.BOLD), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+
         val notification = NotificationCompat.Builder(this, CHANNEL_CALLS)
-            .setSmallIcon(R.drawable.ic_handset)
+            .setSmallIcon(R.drawable.ic_call_answer)
             .setContentTitle("Incoming Aida Call: $caller")
             .setContentText("Screening · Tap to view live transcript")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -236,9 +258,10 @@ class AlertingService : Service() {
             .setAutoCancel(true)
             .setFullScreenIntent(fullScreenPendingIntent, true)
             .setContentIntent(fullScreenPendingIntent)
-            .addAction(R.drawable.ic_handset, "Take Over", takeoverPendingIntent)
+            .setCustomContentView(remoteViews)
+            .setCustomHeadsUpContentView(remoteViews)
+            .addAction(R.drawable.ic_call_answer, actionTitle, takeoverPendingIntent)
             .setColor(android.graphics.Color.rgb(46, 125, 50))
-            .setColorized(true)
             .build()
 
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -314,6 +337,11 @@ class AlertingService : Service() {
             } else {
                 context.startService(intent)
             }
+        }
+
+        fun dismissCallAlert(context: Context) {
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            manager?.cancel(NOTIFICATION_ID_CALL_ALERT)
         }
     }
 }

@@ -1,6 +1,7 @@
 package ai.localsplash.aida.handset
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -50,7 +51,9 @@ class MainActivity : Activity() {
     private lateinit var rootContainer: LinearLayout
     private lateinit var statusText: TextView
     private lateinit var callsTabs: LinearLayout
+    private lateinit var tabsScroll: HorizontalScrollView
     private lateinit var detailContainer: LinearLayout
+    private var detachBtn: Button? = null
     private var transcriptScroll: ScrollView? = null
     private var transcriptView: TextView? = null
     private var transcriptStateView: TextView? = null
@@ -87,20 +90,28 @@ class MainActivity : Activity() {
         val shouldTakeover = intent.getBooleanExtra("EXTRA_ACTION_TAKEOVER", false)
         Log.i(TAG, "handleIntent: callId=$callId, shouldTakeover=$shouldTakeover, selectedCallId=$selectedCallId")
         scope.launch {
+            AlertingService.dismissCallAlert(this@MainActivity)
             val calls = AlertingService.activeCalls.value
             val target = calls.find { it.id == callId }
             if (target != null) {
-                if (selectedCallId != callId || selectedCall == null) {
+                if (selectedCallId != callId || selectedCall == null || live.currentCallId != callId || !live.isConnected) {
                     openCall(target)
+                } else {
+                    renderCallScreen(target)
+                    updateTranscriptUI()
                 }
                 if (shouldTakeover) {
                     executeTakeover(target)
                 }
             } else {
-                if (selectedCallId != callId || selectedCall == null) {
+                if (selectedCallId != callId || selectedCall == null || live.currentCallId != callId || !live.isConnected) {
                     fetchAndOpenCall(callId, shouldTakeover)
-                } else if (shouldTakeover) {
-                    selectedCall?.let { executeTakeover(it) }
+                } else {
+                    selectedCall?.let {
+                        renderCallScreen(it)
+                        updateTranscriptUI()
+                        if (shouldTakeover) executeTakeover(it)
+                    }
                 }
             }
         }
@@ -137,16 +148,19 @@ class MainActivity : Activity() {
         super.onStart()
         foreground = true
         startPolling()
-        selectedCall?.let { openCall(it, reconnect = true) }
+        selectedCall?.let {
+            if (live.currentCallId != it.id || !live.isConnected) {
+                openCall(it)
+            } else {
+                renderCallScreen(it)
+                updateTranscriptUI()
+            }
+        }
     }
 
     override fun onStop() {
         foreground = false
         polling?.cancel()
-        loadingCall?.cancel()
-        earlyJoinJob?.cancel()
-        live.close()
-        reducer?.interrupted()
         super.onStop()
     }
 
@@ -240,45 +254,102 @@ class MainActivity : Activity() {
         val currentSession = session ?: return
         api = PlatformApi(currentSession.serverUrl, currentSession.token)
 
-        rootContainer = column().apply { setPadding(dp(16), dp(12), dp(16), dp(12)) }
+        rootContainer = column().apply { setPadding(dp(12), dp(8), dp(12), dp(8)) }
 
-        val header = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         val extLabel = "${getString(R.string.app_name)}  ·  Ext ${currentSession.device.extension} (${currentSession.device.context})"
-        header.addView(label(extLabel, 20f).apply { setTypeface(null, Typeface.BOLD) }, LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(button("Detach") { confirmDetach() })
+        header.addView(label(extLabel, 18f).apply { setTypeface(null, Typeface.BOLD) }, LinearLayout.LayoutParams(0, -2, 1f))
 
+        detachBtn = Button(this).apply {
+            text = "Unpair phone"
+            textSize = 12f
+            setTextColor(Color.rgb(130, 140, 150))
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            minHeight = dp(32)
+            isAllCaps = false
+            setOnClickListener { showDetachConfirmation() }
+        }
+        header.addView(detachBtn)
         rootContainer.addView(header)
 
-        statusText = label("Connected. Waiting for calls…", 15f)
+        statusText = label("Connected. Waiting for calls…", 13f).apply {
+            setTextColor(Color.rgb(100, 116, 139))
+        }
         rootContainer.addView(statusText)
 
-        // Simultaneous calls tabs
+        // Simultaneous calls tabs (only displayed when multiple calls exist)
         callsTabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val tabsScroll = HorizontalScrollView(this).apply { addView(callsTabs) }
-        rootContainer.addView(tabsScroll, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(4), 0, dp(8)) })
+        tabsScroll = HorizontalScrollView(this).apply {
+            visibility = View.GONE
+            addView(callsTabs)
+        }
+        rootContainer.addView(tabsScroll, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(2), 0, dp(4)) })
 
         // Detail area
-        detailContainer = column().apply { setPadding(dp(8), dp(8), dp(8), dp(8)) }
-        detailContainer.addView(label("No call selected.", 20f))
+        detailContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+        renderIdleScreen()
         rootContainer.addView(detailContainer, LinearLayout.LayoutParams(-1, 0, 1f))
 
         setContentView(rootContainer)
         startPolling()
     }
 
+    private fun renderIdleScreen() {
+        detailContainer.removeAllViews()
+        detailContainer.orientation = LinearLayout.VERTICAL
+        val idleLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(32), 0, 0)
+        }
+        idleLayout.addView(label("No active calls", 18f).apply {
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(148, 163, 184))
+            setTypeface(null, Typeface.BOLD)
+        })
+        idleLayout.addView(label("Monitoring queue for incoming calls…", 14f).apply {
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(148, 163, 184))
+        })
+        detailContainer.addView(idleLayout, LinearLayout.LayoutParams(-1, -1))
+        detachBtn?.visibility = View.VISIBLE
+        statusText.visibility = View.VISIBLE
+    }
+
+    private fun showDetachConfirmation() {
+        val ext = session?.device?.extension ?: "this extension"
+        AlertDialog.Builder(this)
+            .setTitle("Unpair Extension?")
+            .setMessage("Are you sure you want to unpair Ext $ext? This phone will stop receiving Aida call alerts until re-identified.")
+            .setPositiveButton("Unpair") { _, _ -> confirmDetach() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun renderCallTabs(calls: List<Call>) {
         callsTabs.removeAllViews()
-        if (calls.isEmpty()) {
-            callsTabs.visibility = View.GONE
+        if (calls.size <= 1) {
+            tabsScroll.visibility = View.GONE
+            if (calls.isEmpty() && selectedCall == null) {
+                renderIdleScreen()
+            }
             return
         }
-        callsTabs.visibility = View.VISIBLE
+        tabsScroll.visibility = View.VISIBLE
         for (call in calls) {
             val isSelected = call.id == selectedCallId
             val tabTitle = "${call.callerNumber ?: "Caller"}\n[${call.queue}] ${call.state}"
             val tabBtn = Button(this).apply {
                 text = tabTitle
                 isAllCaps = false
+                textSize = 12f
                 setBackgroundColor(if (isSelected) Color.rgb(200, 225, 255) else Color.rgb(240, 240, 240))
                 setTextColor(Color.rgb(20, 20, 20))
                 setOnClickListener {
@@ -340,19 +411,26 @@ class MainActivity : Activity() {
     }
 
     private fun openCall(call: Call, reconnect: Boolean = false) {
+        AlertingService.dismissCallAlert(this)
         selectedCallId = call.id
         selectedCall = call
         loadingCall?.cancel()
         earlyJoinJob?.cancel()
-        live.close()
 
-        if (reducer == null || reducer?.lines?.isEmpty() == true || reconnect) {
+        if (reducer == null || reducer?.callId != call.id) {
             reducer = TranscriptReducer(call.id, capacity = 200)
         } else if (reconnect) {
             reducer?.interrupted()
         }
 
         renderCallScreen(call)
+
+        if (!reconnect && live.currentCallId == call.id && live.isConnected) {
+            updateTranscriptUI()
+            return
+        }
+
+        live.close()
 
         loadingCall = scope.launch {
             try {
@@ -417,80 +495,110 @@ class MainActivity : Activity() {
 
     private fun renderCallScreen(call: Call) {
         detailContainer.removeAllViews()
+        detailContainer.orientation = LinearLayout.HORIZONTAL
+        detachBtn?.visibility = View.GONE
+        statusText.visibility = View.GONE
 
-        // Call Info row
-        val infoRow = LinearLayout(this).apply {
+        // Left panel: Call details & Takeover button (width: 240dp)
+        val leftPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, dp(12), 0)
+        }
+
+        val callerNum = call.callerNumber ?: "Caller"
+        leftPanel.addView(label(callerNum, 22f).apply {
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.rgb(28, 41, 57))
+        })
+
+        val metaRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val callerNum = call.callerNumber ?: "Caller"
-        infoRow.addView(label("$callerNum  (${call.queue})", 24f).apply { setTypeface(null, Typeface.BOLD) }, LinearLayout.LayoutParams(0, -2, 1f))
+        metaRow.addView(label("Queue: ${call.queue}", 14f).apply {
+            setTextColor(Color.rgb(100, 116, 139))
+        }, LinearLayout.LayoutParams(0, -2, 1f))
 
         val startTime = callStartTimes.getOrPut(call.id) { SystemClock.elapsedRealtime() }
         chronometerView = Chronometer(this).apply {
-            textSize = 18f
-            setTextColor(Color.rgb(100, 100, 100))
+            textSize = 14f
+            setTextColor(Color.rgb(100, 116, 139))
             base = startTime
             start()
         }
-        infoRow.addView(chronometerView)
-        detailContainer.addView(infoRow)
+        metaRow.addView(chronometerView)
+        leftPanel.addView(metaRow)
 
         // State banner
-        stateBannerView = label("State: ${call.state}", 16f).apply {
-            setPadding(dp(8), dp(4), dp(8), dp(4))
+        stateBannerView = TextView(this).apply {
+            text = "State: ${call.state}"
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.rgb(30, 64, 175))
             setBackgroundColor(Color.rgb(230, 240, 255))
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            gravity = Gravity.CENTER
         }
-        detailContainer.addView(stateBannerView)
+        leftPanel.addView(stateBannerView, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(8), 0, dp(8)) })
 
         // Takeover Button - Green styling (#2E7D32)
         takeOverBtn = Button(this).apply {
             text = "Take over"
-            textSize = 20f
+            textSize = 18f
             setTypeface(null, Typeface.BOLD)
-            minHeight = dp(64)
+            minHeight = dp(52)
             setBackgroundColor(Color.rgb(46, 125, 50))
             setTextColor(Color.WHITE)
             isAllCaps = false
             setOnClickListener { executeTakeover(call) }
         }
-        detailContainer.addView(takeOverBtn, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(8), 0, dp(8)) })
+        leftPanel.addView(takeOverBtn, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(4), 0, 0) })
 
-        // Transcript controls
+        // Right panel: Live Transcript (weight: 1f, full available height)
+        val rightPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
         val transcriptHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(4))
         }
-        transcriptStateView = label("Connecting live transcript…", 15f)
+        transcriptStateView = label("Connecting live transcript…", 13f).apply {
+            setTextColor(Color.rgb(100, 116, 139))
+        }
         transcriptHeader.addView(transcriptStateView, LinearLayout.LayoutParams(0, -2, 1f))
 
-        jumpToLatestBtn = button("Jump to latest") {
-            transcriptScroll?.fullScroll(View.FOCUS_DOWN)
-        }.apply {
+        jumpToLatestBtn = Button(this).apply {
+            text = "Jump to latest ↓"
+            textSize = 12f
+            isAllCaps = false
             visibility = View.GONE
-            minHeight = dp(40)
+            minHeight = dp(32)
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+            setOnClickListener { transcriptScroll?.fullScroll(View.FOCUS_DOWN) }
         }
         transcriptHeader.addView(jumpToLatestBtn)
-        detailContainer.addView(transcriptHeader)
+        rightPanel.addView(transcriptHeader)
 
-        gapNoticeView = label("", 13f).apply {
+        gapNoticeView = label("", 12f).apply {
             setTextColor(Color.rgb(160, 80, 0))
             visibility = View.GONE
         }
-        detailContainer.addView(gapNoticeView)
+        rightPanel.addView(gapNoticeView)
 
-        // Transcript Scroll View
+        // Transcript Scroll View & Content
         transcriptView = TextView(this).apply {
-            textSize = 20f
+            textSize = 16f
             setTextColor(Color.rgb(28, 41, 57))
-            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             setTextIsSelectable(true)
             setLineSpacing(0f, 1.25f)
             text = "Connecting to Aida…"
         }
         transcriptScroll = ScrollView(this).apply {
             setBackgroundColor(Color.rgb(245, 247, 250))
-            addView(transcriptView)
+            addView(transcriptView, LinearLayout.LayoutParams(-1, -2))
             setOnScrollChangeListener { _, _, scrollY, _, _ ->
                 val child = getChildAt(0)
                 if (child != null) {
@@ -500,7 +608,10 @@ class MainActivity : Activity() {
                 }
             }
         }
-        detailContainer.addView(transcriptScroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { setMargins(0, dp(4), 0, 0) })
+        rightPanel.addView(transcriptScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        detailContainer.addView(leftPanel, LinearLayout.LayoutParams(dp(240), -1))
+        detailContainer.addView(rightPanel, LinearLayout.LayoutParams(0, -1, 1f))
 
         updateCallState(call)
         updateTranscriptUI()
@@ -599,8 +710,7 @@ class MainActivity : Activity() {
                 selectedCallId = null
                 selectedCall = null
                 reducer = null
-                detailContainer.removeAllViews()
-                detailContainer.addView(label("Select a call to view its live transcript.", 20f))
+                renderIdleScreen()
             }
         }
     }

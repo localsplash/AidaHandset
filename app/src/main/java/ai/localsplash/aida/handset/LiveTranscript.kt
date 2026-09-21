@@ -27,6 +27,11 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
     private var events: Job? = null
     @Volatile private var expectedCallId: String? = null
     @Volatile private var boundAgentSid: String? = null
+    @Volatile private var isRoomConnected = false
+    val isConnected: Boolean
+        get() = isRoomConnected && room != null
+    val currentCallId: String?
+        get() = expectedCallId
     private val pendingBuffer = Collections.synchronizedList(mutableListOf<Pair<String?, TranscriptEvent>>())
     private val streamSequenceCounters = Collections.synchronizedMap(mutableMapOf<String, Long>())
     private var onEventCallback: ((TranscriptEvent) -> Unit)? = null
@@ -73,6 +78,7 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
             joined.events.collect { event ->
                 when (event) {
                     is RoomEvent.Connected -> {
+                        isRoomConnected = true
                         Log.i(TAG, "Room Connected: ${joined.name}")
                         onState("Live transcript connected", false)
                     }
@@ -81,14 +87,17 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
                         onState("Reconnecting transcript…", true)
                     }
                     is RoomEvent.Reconnected -> {
+                        isRoomConnected = true
                         Log.i(TAG, "Room Reconnected: ${joined.name}")
                         onState("Live transcript reconnected", true)
                     }
                     is RoomEvent.Disconnected -> {
+                        isRoomConnected = false
                         Log.w(TAG, "Room Disconnected: ${joined.name}, error: ${event.error}")
                         onState("Transcript disconnected.", true)
                     }
                     is RoomEvent.FailedToConnect -> {
+                        isRoomConnected = false
                         val msg = event.error?.message ?: "Connection failed"
                         Log.e(TAG, "Room FailedToConnect: ${joined.name}, error: $msg", event.error)
                         onState("Transcript unavailable: $msg", true)
@@ -249,6 +258,7 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
             room?.release()
         } catch (_: Exception) {}
         room = null
+        isRoomConnected = false
         expectedCallId = null
         boundAgentSid = null
         onEventCallback = null

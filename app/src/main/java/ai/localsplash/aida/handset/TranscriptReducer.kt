@@ -18,7 +18,7 @@ data class TranscriptLine(
 }
 
 /** In-memory live display, bounded for long calls. Sequence numbers are per agent stream. */
-class TranscriptReducer(private val callId: String, private val capacity: Int = 200) {
+class TranscriptReducer(val callId: String, private val capacity: Int = 200) {
     private val segments = linkedMapOf<String, TranscriptLine>()
     private val seen = linkedSetOf<String>()
     private val retiredStreams = mutableSetOf<String>()
