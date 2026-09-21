@@ -189,9 +189,9 @@ class MainActivity : Activity() {
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 val errResp = (error as? ApiException)?.errorResponse
-                val reason = errResp?.reason ?: errResp?.message ?: error.message ?: "Attach failed"
-                val publicIpSeen = errResp?.publicIpSeen
-                val sentIps = if (errResp != null && errResp.sentIps.isNotEmpty()) errResp.sentIps else localIps
+                val reason = errResp?.reason ?: errResp?.message ?: errResp?.error ?: error.message ?: "Attach failed"
+                val publicIpSeen = errResp?.displayPublicIp
+                val sentIps = errResp?.displayLocalIps?.ifEmpty { null } ?: localIps
                 showAttachFailure(serverUrl, sentIps, publicIpSeen, reason)
             }
         }

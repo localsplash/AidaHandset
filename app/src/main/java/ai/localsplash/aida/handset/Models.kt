@@ -7,6 +7,7 @@ data class AttachRequest(
     val appInstanceId: String,
     val localIps: List<String>,
     val deviceModel: String,
+    val appVersion: String = "1.0.0",
     val claimedMac: String? = null,
 )
 
@@ -32,9 +33,14 @@ data class AttachErrorResponse(
     val error: String,
     val message: String? = null,
     val sentIps: List<String> = emptyList(),
+    val localIps: List<String> = emptyList(),
+    val publicIp: String? = null,
     val publicIpSeen: String? = null,
     val reason: String? = null,
-)
+) {
+    val displayPublicIp: String? get() = publicIp ?: publicIpSeen
+    val displayLocalIps: List<String> get() = if (localIps.isNotEmpty()) localIps else sentIps
+}
 
 @Serializable
 data class QueueInfo(
