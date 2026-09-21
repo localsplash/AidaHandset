@@ -15,9 +15,13 @@ import kotlinx.serialization.encodeToString
 /** Only ciphertext is written to app-private storage; the AES key stays in Android Keystore. */
 class SecureSessionStore(context: Context) {
     private val prefs = context.getSharedPreferences("handset", Context.MODE_PRIVATE)
-    val deviceId: String = prefs.getString("installationId", null) ?: UUID.randomUUID().toString().also {
-        check(prefs.edit().putString("installationId", it).commit()) { "Unable to save device identity." }
-    }
+    val appInstanceId: String = prefs.getString("appInstanceId", null)
+        ?: prefs.getString("installationId", null)
+        ?: UUID.randomUUID().toString().also {
+            check(prefs.edit().putString("appInstanceId", it).commit()) { "Unable to save app instance identity." }
+        }
+
+    val deviceId: String get() = appInstanceId
 
     fun read(): DeviceSession? {
         val stored = prefs.getString("session", null) ?: return null
@@ -34,10 +38,15 @@ class SecureSessionStore(context: Context) {
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val ciphertext = cipher.doFinal(PlatformApi.json.encodeToString(session).toByteArray(Charsets.UTF_8))
         val value = Base64.encodeToString(cipher.iv, Base64.NO_WRAP) + ":" + Base64.encodeToString(ciphertext, Base64.NO_WRAP)
-        check(prefs.edit().putString("session", value).commit()) { "Unable to save secure enrollment." }
+        check(prefs.edit().putString("session", value).commit()) { "Unable to save secure session." }
     }
 
-    fun clear() { check(prefs.edit().remove("session").commit()) { "Unable to remove enrollment." } }
+    fun updatePendingTakeover(pending: PendingTakeover?) {
+        val current = read() ?: return
+        save(current.copy(pendingTakeover = pending))
+    }
+
+    fun clear() { check(prefs.edit().remove("session").commit()) { "Unable to remove session." } }
 
     private fun key(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }

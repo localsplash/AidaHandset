@@ -1,15 +1,19 @@
 package ai.localsplash.aida.handset
 
 import android.app.Activity
-import android.app.AlertDialog
+import android.content.Intent
 import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Bundle
+import android.os.SystemClock
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.Chronometer
 import android.widget.EditText
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -27,43 +31,109 @@ import kotlinx.coroutines.launch
 class MainActivity : Activity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var store: SecureSessionStore
-    private lateinit var live: LiveTranscript
+    private val live = LiveTranscript(this, scope)
     private var session: DeviceSession? = null
     private var api: PlatformApi? = null
     private var polling: Job? = null
     private var loadingCall: Job? = null
+    private var earlyJoinJob: Job? = null
     private var commandJob: Job? = null
-    private var selected: Call? = null
+    private var selectedCallId: String? = null
+    private var selectedCall: Call? = null
     private var reducer: TranscriptReducer? = null
     private var foreground = false
-    private lateinit var status: TextView
-    private lateinit var callsColumn: LinearLayout
-    private lateinit var detailColumn: LinearLayout
-    private var transcript: TextView? = null
-    private var transcriptState: TextView? = null
-    private var gap: TextView? = null
-    private var takeOver: Button? = null
+    private var autoScroll = true
+
+    // UI elements
+    private lateinit var rootContainer: LinearLayout
+    private lateinit var statusText: TextView
+    private lateinit var callsTabs: LinearLayout
+    private lateinit var detailContainer: LinearLayout
+    private var transcriptScroll: ScrollView? = null
+    private var transcriptView: TextView? = null
+    private var transcriptStateView: TextView? = null
+    private var gapNoticeView: TextView? = null
+    private var jumpToLatestBtn: Button? = null
+    private var takeOverBtn: Button? = null
+    private var stateBannerView: TextView? = null
+    private var chronometerView: Chronometer? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         store = SecureSessionStore(this)
-        live = LiveTranscript(this, scope)
+        AlertingService.start(this)
+
         session = store.read()
-        if (session == null) showEnrollment() else showWorkspace()
+        if (session == null) {
+            attemptAttach()
+        } else {
+            showWorkspace()
+        }
+
+        observeIncomingAlerts()
+        handleIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        val callId = intent?.getStringExtra("EXTRA_CALL_ID") ?: return
+        selectedCallId = callId
+        scope.launch {
+            val calls = AlertingService.activeCalls.value
+            val target = calls.find { it.id == callId }
+            if (target != null) {
+                openCall(target)
+            } else {
+                fetchAndOpenCall(callId)
+            }
+        }
+    }
+
+    private fun observeIncomingAlerts() {
+        scope.launch {
+            AlertingService.incomingAlertCall.collect { callId ->
+                if (selectedCallId == null || selectedCallId == callId) {
+                    selectedCallId = callId
+                    fetchAndOpenCall(callId)
+                }
+            }
+        }
+        scope.launch {
+            AlertingService.activeCalls.collect { calls ->
+                if (session != null) {
+                    renderCallTabs(calls)
+                    val currentId = selectedCallId
+                    if (currentId != null) {
+                        val current = calls.find { it.id == currentId }
+                        if (current != null) {
+                            updateCallState(current)
+                        } else if (selectedCall != null) {
+                            handleCallEnded()
+                        }
+                    }
+                }
+            }
+        }
     }
 
     override fun onStart() {
         super.onStart()
         foreground = true
         startPolling()
-        selected?.let { openCall(it, reconnect = true) }
+        selectedCall?.let { openCall(it, reconnect = true) }
     }
 
     override fun onStop() {
         foreground = false
         polling?.cancel()
         loadingCall?.cancel()
+        earlyJoinJob?.cancel()
         live.close()
         reducer?.interrupted()
         super.onStop()
@@ -75,255 +145,475 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
-    private fun showEnrollment(message: String? = null) {
+    private fun attemptAttach(customServerUrl: String? = null) {
+        val serverUrl = customServerUrl ?: session?.serverUrl ?: getString(R.string.default_server_url)
         val root = column().apply { setPadding(dp(28), dp(24), dp(28), dp(24)) }
         root.addView(label(getString(R.string.app_name), 28f))
-        root.addView(label("Pair this phone with one business extension using the one-time code from Aida Admin.", 18f))
-        val server = EditText(this).apply {
-            hint = "OfficePulse server URL"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setText(getString(R.string.default_server_url))
-            setSingleLine()
-        }
-        val code = EditText(this).apply {
-            hint = "One-time enrollment code"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setSingleLine()
-            isSaveEnabled = false
-        }
-        status = label(message ?: "The phone's built-in SIP app continues to handle audio.", 16f)
-        root.addView(server)
-        root.addView(code)
-        val pair = button("Pair handset") {
-            if (code.text.isBlank()) { status.text = "Enter the enrollment code from Aida Admin."; return@button }
-            val endpoint = server.text.toString().trim()
-            val enrollmentCode = code.text.toString()
-            it.isEnabled = false
-            status.text = "Pairing…"
-            scope.launch {
-                try {
-                    val result = PlatformApi(endpoint).enroll(enrollmentCode, store.deviceId)
-                    check(result.token.isNotBlank() && result.device.id.isNotBlank()) { "The server returned an invalid enrollment." }
-                    val paired = DeviceSession(endpoint, result.token, result.device)
-                    store.save(paired)
-                    session = paired
-                    code.text.clear()
-                    showWorkspace()
-                } catch (error: Exception) {
-                    if (error is CancellationException) throw error
-                    status.text = friendly(error)
-                    it.isEnabled = true
-                }
+        val status = label("Identifying this phone…", 18f)
+        root.addView(status)
+        setContentView(ScrollView(this).apply { addView(root) })
+
+        scope.launch {
+            val localIps = DeviceIdentifier.getLocalIps()
+            val claimedMac = DeviceIdentifier.getClaimedMac()
+            val deviceModel = DeviceIdentifier.getDeviceModel()
+
+            val attachApi = try {
+                PlatformApi(serverUrl)
+            } catch (e: Exception) {
+                showAttachFailure(serverUrl, localIps, null, e.message ?: "Invalid server URL")
+                return@launch
+            }
+
+            try {
+                val resp = attachApi.attach(
+                    AttachRequest(
+                        appInstanceId = store.appInstanceId,
+                        localIps = localIps,
+                        deviceModel = deviceModel,
+                        claimedMac = claimedMac,
+                    )
+                )
+                val newSession = DeviceSession(
+                    serverUrl = serverUrl,
+                    token = resp.token,
+                    expiresAt = resp.expiresAt,
+                    device = resp.device,
+                )
+                store.save(newSession)
+                session = newSession
+                status.text = "Extension ${resp.device.extension} (${resp.device.context})"
+                delay(600)
+                showWorkspace()
+                AlertingService.instance?.triggerRefresh()
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                val errResp = (error as? ApiException)?.errorResponse
+                val reason = errResp?.reason ?: errResp?.message ?: error.message ?: "Attach failed"
+                val publicIpSeen = errResp?.publicIpSeen
+                val sentIps = if (errResp != null && errResp.sentIps.isNotEmpty()) errResp.sentIps else localIps
+                showAttachFailure(serverUrl, sentIps, publicIpSeen, reason)
             }
         }
-        root.addView(pair)
-        root.addView(status)
+    }
+
+    private fun showAttachFailure(serverUrl: String, sentIps: List<String>, publicIpSeen: String?, reason: String) {
+        val root = column().apply { setPadding(dp(28), dp(24), dp(28), dp(24)) }
+        root.addView(label(getString(R.string.app_name), 28f))
+        root.addView(label("Handset identification failed", 22f).apply { setTextColor(Color.rgb(180, 40, 40)) })
+        root.addView(label("Reason: $reason", 16f))
+        root.addView(label("Local IPs sent: ${sentIps.joinToString(", ").ifEmpty { "None found" }}", 15f))
+        if (publicIpSeen != null) {
+            root.addView(label("Public IP seen by server: $publicIpSeen", 15f))
+        }
+        root.addView(label("Verify this phone is registered on the correct VLAN and extension.", 14f))
+
+        val serverInput = EditText(this).apply {
+            hint = "Server URL"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setText(serverUrl)
+            setSingleLine()
+        }
+        root.addView(serverInput)
+
+        val retryBtn = button("Retry identification") {
+            val target = serverInput.text.toString().trim().ifEmpty { getString(R.string.default_server_url) }
+            attemptAttach(target)
+        }
+        root.addView(retryBtn)
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
     private fun showWorkspace() {
-        val paired = session ?: return
-        api = PlatformApi(paired.serverUrl, paired.token)
-        val root = column().apply { setPadding(dp(16), dp(12), dp(16), dp(12)) }
+        val currentSession = session ?: return
+        api = PlatformApi(currentSession.serverUrl, currentSession.token)
+
+        rootContainer = column().apply { setPadding(dp(16), dp(12), dp(16), dp(12)) }
+
         val header = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        header.addView(label("${getString(R.string.app_name)}  ·  Business ${paired.device.iTenantId}  ·  Ext ${paired.device.extensionId}", 20f), LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(button("Unpair") { confirmUnpair() })
-        header.addView(button("Pending request") {
-            val pending = session?.pending
-            AlertDialog.Builder(this).setTitle("Pending takeover")
-                .setMessage(if (pending == null) "There is no pending takeover." else
-                    "Call ${pending.callId} has an unconfirmed takeover. Open it to retry. Clear only after checking the phone; clearing does not cancel the requested handoff.")
-                .setNegativeButton("Close", null).apply {
-                    if (pending != null) setPositiveButton("Clear pending retry") { _, _ ->
-                        persistPending(null)
-                        takeOver?.text = "Take over"
-                    }
-                }.show()
-        })
-        root.addView(header)
-        status = label("Loading authorized calls…", 16f)
-        root.addView(status)
-        val body = LinearLayout(this)
-        callsColumn = column()
-        detailColumn = column().apply { setPadding(dp(16), 0, 0, 0) }
-        detailColumn.addView(label("Select a call to view its live transcript.", 22f))
-        body.addView(ScrollView(this).apply { addView(callsColumn) }, LinearLayout.LayoutParams(0, -1, 1f))
-        body.addView(detailColumn, LinearLayout.LayoutParams(0, -1, 2f))
-        root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
-        setContentView(root)
+        val extLabel = "${getString(R.string.app_name)}  ·  Ext ${currentSession.device.extension} (${currentSession.device.context})"
+        header.addView(label(extLabel, 20f).apply { setTypeface(null, Typeface.BOLD) }, LinearLayout.LayoutParams(0, -2, 1f))
+        header.addView(button("Detach") { confirmDetach() })
+
+        rootContainer.addView(header)
+
+        statusText = label("Connected. Waiting for calls…", 15f)
+        rootContainer.addView(statusText)
+
+        // Simultaneous calls tabs
+        callsTabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val tabsScroll = HorizontalScrollView(this).apply { addView(callsTabs) }
+        rootContainer.addView(tabsScroll, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(4), 0, dp(8)) })
+
+        // Detail area
+        detailContainer = column().apply { setPadding(dp(8), dp(8), dp(8), dp(8)) }
+        detailContainer.addView(label("No call selected.", 20f))
+        rootContainer.addView(detailContainer, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        setContentView(rootContainer)
         startPolling()
+    }
+
+    private fun renderCallTabs(calls: List<Call>) {
+        callsTabs.removeAllViews()
+        if (calls.isEmpty()) {
+            callsTabs.visibility = View.GONE
+            return
+        }
+        callsTabs.visibility = View.VISIBLE
+        for (call in calls) {
+            val isSelected = call.id == selectedCallId
+            val tabTitle = "${call.callerNumber ?: "Caller"}\n[${call.queue}] ${call.state}"
+            val tabBtn = Button(this).apply {
+                text = tabTitle
+                isAllCaps = false
+                setBackgroundColor(if (isSelected) Color.rgb(200, 225, 255) else Color.rgb(240, 240, 240))
+                setTextColor(Color.rgb(20, 20, 20))
+                setOnClickListener { openCall(call) }
+            }
+            callsTabs.addView(tabBtn, LinearLayout.LayoutParams(-2, -2).apply { setMargins(0, 0, dp(8), 0) })
+        }
     }
 
     private fun startPolling() {
         if (!foreground || session == null || polling?.isActive == true) return
         polling = scope.launch {
             while (isActive) {
-                refreshCalls()
+                try {
+                    val calls = api?.calls() ?: emptyList()
+                    AlertingService.activeCalls.value = calls
+                    statusText.text = if (calls.isEmpty()) "Monitoring queue · No active calls" else "${calls.size} active call(s)"
+                } catch (e: ApiException) {
+                    if (e.status == 401 || e.status == 403) {
+                        reAttachSilently()
+                    }
+                } catch (_: Exception) {}
                 delay(5000)
             }
         }
     }
 
-    private suspend fun refreshCalls() {
+    private suspend fun reAttachSilently() {
+        val s = session ?: return
+        val localIps = DeviceIdentifier.getLocalIps()
+        if (localIps.isEmpty()) return
         try {
-            val calls = api?.calls() ?: return
-            status.text = if (calls.isEmpty()) "No active calls for this extension." else "${calls.size} active call(s) · updates every 5 seconds"
-            callsColumn.removeAllViews()
-            for (call in calls) {
-                callsColumn.addView(button("${call.caller ?: "Caller"}\n${call.status} · ${call.id.take(12)}") { openCall(call) })
-            }
-            val current = selected
-            if (current != null) {
-                val updated = calls.find { it.id == current.id }
-                if (updated == null) {
-                    loadingCall?.cancel()
-                    live.close()
-                    selected = null
-                    takeOver?.isEnabled = false
-                    transcriptState?.text = "Call ended or access removed."
-                } else {
-                    selected = updated
-                }
-            }
-        } catch (error: Exception) { handle(error) }
+            val resp = PlatformApi(s.serverUrl).attach(
+                AttachRequest(
+                    appInstanceId = store.appInstanceId,
+                    localIps = localIps,
+                    deviceModel = DeviceIdentifier.getDeviceModel(),
+                    claimedMac = DeviceIdentifier.getClaimedMac(),
+                )
+            )
+            val updated = s.copy(token = resp.token, expiresAt = resp.expiresAt, device = resp.device)
+            store.save(updated)
+            session = updated
+            api = PlatformApi(updated.serverUrl, updated.token)
+        } catch (_: Exception) {}
+    }
+
+    private suspend fun fetchAndOpenCall(callId: String) {
+        try {
+            val detail = api?.call(callId) ?: return
+            openCall(detail.call)
+        } catch (_: Exception) {}
     }
 
     private fun openCall(call: Call, reconnect: Boolean = false) {
+        selectedCallId = call.id
+        selectedCall = call
         loadingCall?.cancel()
+        earlyJoinJob?.cancel()
         live.close()
-        if (selected?.id != call.id) reducer = TranscriptReducer(call.id) else if (reconnect) reducer?.interrupted()
-        selected = call
-        renderDetail(call)
+
+        if (reducer == null || reducer?.lines?.isEmpty() == true || reconnect) {
+            reducer = TranscriptReducer(call.id, capacity = 200)
+        } else if (reconnect) {
+            reducer?.interrupted()
+        }
+
+        renderCallScreen(call)
+
         loadingCall = scope.launch {
             try {
                 val detail = api?.call(call.id) ?: return@launch
-                check(detail.call.id == call.id) { "The server returned the wrong call." }
-                selected = detail.call
-                val room = detail.livekit
-                if (room == null) {
-                    transcriptState?.text = "Live transcription is not available for this call yet. Tap Reconnect to retry."
-                } else {
-                    live.connect(room, onEvent = { event ->
-                        if (selected?.id == call.id && reducer?.accept(event) == true) updateTranscript()
-                    }, onState = { message, interrupted ->
-                        if (selected?.id == call.id) {
-                            transcriptState?.text = message
-                            if (interrupted) reducer?.interrupted()
-                            updateTranscript()
+                selectedCall = detail.call
+                updateCallState(detail.call)
+
+                val livekit = detail.livekit
+                if (livekit == null) {
+                    transcriptStateView?.text = "Waiting for room credentials…"
+                    return@launch
+                }
+
+                // Join room early
+                live.connect(
+                    callId = call.id,
+                    session = livekit,
+                    agentParticipantSid = detail.agentParticipantSid,
+                    onEvent = { event ->
+                        if (selectedCallId == call.id && reducer?.accept(event) == true) {
+                            runOnUiThread { updateTranscriptUI() }
                         }
-                    })
+                    },
+                    onState = { stateMsg, interrupted ->
+                        if (selectedCallId == call.id) {
+                            runOnUiThread {
+                                transcriptStateView?.text = stateMsg
+                                if (interrupted) reducer?.interrupted()
+                                updateTranscriptUI()
+                            }
+                        }
+                    },
+                )
+
+                // If agentParticipantSid is not yet known, poll call detail every 1s for up to 10s
+                if (detail.agentParticipantSid.isNullOrBlank()) {
+                    earlyJoinJob = launch {
+                        for (i in 1..10) {
+                            delay(1000)
+                            if (!isActive || selectedCallId != call.id) break
+                            val refreshed = runCatching { api?.call(call.id) }.getOrNull() ?: continue
+                            val sid = refreshed.agentParticipantSid
+                            if (!sid.isNullOrBlank()) {
+                                live.updateAgentParticipantSid(sid)
+                                break
+                            }
+                        }
+                    }
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
-                transcriptState?.text = "Live transcript unavailable. Tap Reconnect."
-                handle(error)
+                transcriptStateView?.text = "Unable to connect transcript."
             }
         }
     }
 
-    private fun renderDetail(call: Call) {
-        detailColumn.removeAllViews()
-        detailColumn.addView(label(call.caller ?: "Active call", 26f))
-        detailColumn.addView(label("${call.status} · ${call.startedAt ?: call.id}", 15f))
-        val actions = LinearLayout(this)
-        takeOver = button(if (session?.pending?.callId == call.id) "Retry pending takeover" else "Take over") { confirmTakeover() }
-        takeOver?.isEnabled = commandJob?.isActive != true
-        actions.addView(takeOver)
-        actions.addView(button("Reconnect") { selected?.let { openCall(it, reconnect = true) } })
-        detailColumn.addView(actions)
-        transcriptState = label("Connecting live transcript…", 16f)
-        detailColumn.addView(transcriptState)
-        gap = label("Live text starts when you open this call. Earlier history is unavailable.", 14f).apply { setTextColor(Color.rgb(135, 77, 0)) }
-        detailColumn.addView(gap)
-        transcript = label("Waiting for speech…", 22f).apply { setTextIsSelectable(true) }
-        detailColumn.addView(ScrollView(this).apply { addView(transcript) }, LinearLayout.LayoutParams(-1, 0, 1f))
-        updateTranscript()
-    }
+    private fun renderCallScreen(call: Call) {
+        detailContainer.removeAllViews()
 
-    private fun updateTranscript() {
-        val state = reducer ?: return
-        gap?.text = state.gapNotice ?: "Live text starts when you open this call. Earlier history is unavailable."
-        transcript?.text = state.lines.joinToString("\n\n") { line ->
-            "${line.speaker?.let { "$it: " }.orEmpty()}${line.text}${if (line.isFinal) "" else " …"}"
-        }.ifEmpty { "Waiting for speech…" }
-    }
+        // Call Info row
+        val infoRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val callerNum = call.callerNumber ?: "Caller"
+        infoRow.addView(label("$callerNum  (${call.queue})", 24f).apply { setTypeface(null, Typeface.BOLD) }, LinearLayout.LayoutParams(0, -2, 1f))
 
-    private fun confirmTakeover() {
-        if (selected == null || commandJob?.isActive == true) return
-        AlertDialog.Builder(this).setTitle("Take over this call?")
-            .setMessage("OfficePulse will request the handoff to this extension. Answer using the phone's SIP controls.")
-            .setNegativeButton("Cancel", null).setPositiveButton("Take over") { _, _ -> executeTakeover() }.show()
-    }
+        chronometerView = Chronometer(this).apply {
+            textSize = 18f
+            setTextColor(Color.rgb(100, 100, 100))
+            base = SystemClock.elapsedRealtime()
+            start()
+        }
+        infoRow.addView(chronometerView)
+        detailContainer.addView(infoRow)
 
-    private fun executeTakeover() {
-        val call = selected ?: return
-        val paired = session ?: return
-        commandJob = scope.launch {
-            takeOver?.isEnabled = false
-            try {
-                val pending = TakeoverPolicy.prepare(call, paired.pending)
-                // Persist before sending: a timeout or process death must never create a second command.
-                val saved = paired.copy(pending = pending)
-                store.save(saved)
-                session = saved
-                api?.takeover(call.id, pending.command) ?: error("Handset is no longer paired.")
-                persistPending(null)
-                status.text = "Takeover request accepted. Follow the phone's SIP controls; call updates confirm progress."
-                takeOver?.text = "Take over"
-            } catch (error: Exception) {
-                if (error is CancellationException) throw error
-                if (error is ApiException && TakeoverPolicy.definitiveRejection(error.status)) persistPending(null)
-                handle(error)
-                if (session?.pending != null) {
-                    status.text = "Takeover outcome is unconfirmed. Retry reuses the saved request; ${friendly(error)}"
-                    takeOver?.text = "Retry pending takeover"
+        // State banner
+        stateBannerView = label("State: ${call.state}", 16f).apply {
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setBackgroundColor(Color.rgb(230, 240, 255))
+        }
+        detailContainer.addView(stateBannerView)
+
+        // Takeover Button
+        takeOverBtn = Button(this).apply {
+            text = "Take over"
+            textSize = 20f
+            setTypeface(null, Typeface.BOLD)
+            minHeight = dp(64)
+            setBackgroundColor(Color.rgb(40, 120, 220))
+            setTextColor(Color.WHITE)
+            isAllCaps = false
+            setOnClickListener { executeTakeover(call) }
+        }
+        detailContainer.addView(takeOverBtn, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(8), 0, dp(8)) })
+
+        // Transcript controls
+        val transcriptHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        transcriptStateView = label("Connecting live transcript…", 15f)
+        transcriptHeader.addView(transcriptStateView, LinearLayout.LayoutParams(0, -2, 1f))
+
+        jumpToLatestBtn = button("Jump to latest") {
+            transcriptScroll?.fullScroll(View.FOCUS_DOWN)
+        }.apply {
+            visibility = View.GONE
+            minHeight = dp(40)
+        }
+        transcriptHeader.addView(jumpToLatestBtn)
+        detailContainer.addView(transcriptHeader)
+
+        gapNoticeView = label("", 13f).apply {
+            setTextColor(Color.rgb(160, 80, 0))
+            visibility = View.GONE
+        }
+        detailContainer.addView(gapNoticeView)
+
+        // Transcript Scroll View
+        transcriptView = label("Connecting to Aida…", 20f).apply {
+            setTextIsSelectable(true)
+            setLineSpacing(0f, 1.2f)
+        }
+        transcriptScroll = ScrollView(this).apply {
+            addView(transcriptView)
+            setOnScrollChangeListener { _, _, scrollY, _, _ ->
+                val child = getChildAt(0)
+                if (child != null) {
+                    val diff = (child.bottom - (height + scrollY))
+                    autoScroll = diff <= dp(30)
+                    jumpToLatestBtn?.visibility = if (autoScroll) View.GONE else View.VISIBLE
                 }
-            } finally { takeOver?.isEnabled = selected != null }
+            }
+        }
+        detailContainer.addView(transcriptScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        updateCallState(call)
+        updateTranscriptUI()
+    }
+
+    private fun updateCallState(call: Call) {
+        selectedCall = call
+        val state = call.state
+        stateBannerView?.text = "State: $state"
+        when (state) {
+            "screening" -> {
+                stateBannerView?.setBackgroundColor(Color.rgb(230, 240, 255))
+                takeOverBtn?.isEnabled = commandJob?.isActive != true
+                takeOverBtn?.text = "Take over"
+            }
+            "ringing" -> {
+                stateBannerView?.setBackgroundColor(Color.rgb(255, 245, 200))
+                stateBannerView?.text = "Ringing your phone…"
+                takeOverBtn?.isEnabled = false
+                takeOverBtn?.text = "Ringing your phone…"
+            }
+            "human-active" -> {
+                stateBannerView?.setBackgroundColor(Color.rgb(220, 255, 220))
+                stateBannerView?.text = "Connected — pick up the handset"
+                takeOverBtn?.isEnabled = false
+                takeOverBtn?.text = "Connected"
+                scope.launch {
+                    delay(3000)
+                    handleCallEnded()
+                }
+            }
+            "fallback", "ended" -> {
+                handleCallEnded()
+            }
         }
     }
 
-    private fun persistPending(pending: PendingCommand?) {
-        session?.copy(pending = pending)?.let { store.save(it); session = it }
+    private fun executeTakeover(call: Call) {
+        if (commandJob?.isActive == true) return
+        val paired = session ?: return
+
+        commandJob = scope.launch {
+            takeOverBtn?.isEnabled = false
+            takeOverBtn?.text = "Requesting takeover…"
+            try {
+                val pending = TakeoverPolicy.prepare(call, paired.pendingTakeover)
+                val savedSession = paired.copy(pendingTakeover = pending)
+                store.save(savedSession)
+                session = savedSession
+
+                val resp = api?.takeover(call.id, TakeoverRequest(pending.idempotencyKey, pending.expectedCallVersion))
+                store.updatePendingTakeover(null)
+                session = store.read()
+
+                stateBannerView?.text = "Ringing your phone…"
+                takeOverBtn?.text = "Ringing your phone…"
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (error is ApiException && TakeoverPolicy.definitiveRejection(error.status)) {
+                    store.updatePendingTakeover(null)
+                    session = store.read()
+                }
+                val reason = when ((error as? ApiException)?.status) {
+                    409 -> "Takeover in progress or already taken."
+                    503 -> "Your phone is busy or unavailable."
+                    else -> error.message ?: "Takeover request failed."
+                }
+                stateBannerView?.text = "Takeover failed: $reason"
+                takeOverBtn?.text = "Take over"
+                takeOverBtn?.isEnabled = true
+            }
+        }
     }
 
-    private fun confirmUnpair() {
-        AlertDialog.Builder(this).setTitle("Unpair this handset?")
-            .setMessage("This removes local access and pending retries. Revoke the device in Aida Admin to invalidate its server token.")
-            .setNegativeButton("Cancel", null).setPositiveButton("Unpair") { _, _ -> unpair() }.show()
-    }
-
-    private fun unpair(message: String? = null) {
-        polling?.cancel()
+    private fun handleCallEnded() {
         loadingCall?.cancel()
-        commandJob?.cancel()
+        earlyJoinJob?.cancel()
         live.close()
-        store.clear()
-        session = null
-        api = null
-        selected = null
-        reducer = null
-        showEnrollment(message)
+        chronometerView?.stop()
+        stateBannerView?.text = "Call ended"
+        stateBannerView?.setBackgroundColor(Color.rgb(240, 240, 240))
+        takeOverBtn?.isEnabled = false
+        takeOverBtn?.text = "Call ended"
+        transcriptStateView?.text = "Transcript closed"
+
+        scope.launch {
+            delay(2000)
+            if (selectedCallId == selectedCall?.id) {
+                selectedCallId = null
+                selectedCall = null
+                reducer = null
+                detailContainer.removeAllViews()
+                detailContainer.addView(label("Select a call to view its live transcript.", 20f))
+            }
+        }
     }
 
-    private fun handle(error: Exception) {
-        if (error is CancellationException) throw error
-        if (error is ApiException && error.status in listOf(401, 403)) unpair(error.message)
-        else status.text = friendly(error)
+    private fun updateTranscriptUI() {
+        val r = reducer ?: return
+        val lines = r.lines
+
+        gapNoticeView?.text = r.gapNotice ?: ""
+        gapNoticeView?.visibility = if (r.gapNotice != null) View.VISIBLE else View.GONE
+
+        if (lines.isEmpty()) {
+            transcriptView?.text = "Waiting for speech…"
+        } else {
+            val formatted = lines.joinToString("\n\n") { line ->
+                val speakerLabel = line.speakerLabel
+                val finalMark = if (line.isFinal) "" else " …"
+                "$speakerLabel: ${line.text}$finalMark"
+            }
+            transcriptView?.text = formatted
+        }
+
+        if (autoScroll) {
+            transcriptScroll?.post {
+                transcriptScroll?.fullScroll(View.FOCUS_DOWN)
+            }
+        }
     }
 
-    private fun friendly(error: Exception): String = when (error) {
-        is ApiException -> error.message ?: "Server request failed."
-        is IllegalArgumentException -> error.message ?: "Check the server URL and enrollment code."
-        is IOException -> "Cannot reach the server. Check this phone's network and the server certificate, then retry."
-        else -> "Unable to complete this action. Check the server configuration and retry."
+    private fun confirmDetach() {
+        scope.launch {
+            try {
+                api?.logout()
+            } catch (_: Exception) {}
+            store.clear()
+            session = null
+            api = null
+            selectedCallId = null
+            selectedCall = null
+            reducer = null
+            live.close()
+            attemptAttach()
+        }
     }
 
     private fun column() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
     private fun label(value: String, size: Float) = TextView(this).apply {
-        text = value; textSize = size; setTextColor(Color.rgb(28, 41, 57)); setPadding(0, dp(6), 0, dp(6))
+        text = value; textSize = size; setTextColor(Color.rgb(28, 41, 57)); setPadding(0, dp(4), 0, dp(4))
     }
     private fun button(value: String, action: (View) -> Unit) = Button(this).apply {
-        text = value; isAllCaps = false; minHeight = dp(52); setOnClickListener(action)
+        text = value; isAllCaps = false; minHeight = dp(48); setOnClickListener(action)
     }
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 }

@@ -4,9 +4,26 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class TranscriptReducerTest {
-    private fun event(sequence: Long = 1, segment: String = "segment-1", final: Boolean = false,
-        text: String = "hello", stream: String = "stream-1", id: String = "$stream-$sequence") =
-        TranscriptEvent("transcript", "call-1", id, stream, sequence, segment, text, final, "2026-09-06T12:00:00Z", "Caller")
+    private fun event(
+        sequence: Long = 1,
+        segment: String = "segment-1",
+        final: Boolean = false,
+        text: String = "hello",
+        stream: String = "stream-1",
+        id: String = "$stream-$sequence",
+        speaker: String = "caller",
+    ) = TranscriptEvent(
+        type = "transcript",
+        callId = "call-1",
+        eventId = id,
+        streamId = stream,
+        sequence = sequence,
+        segmentId = segment,
+        text = text,
+        isFinal = final,
+        timestamp = "2026-09-19T17:00:00.000Z",
+        speaker = speaker,
+    )
 
     @Test fun partialIsReplacedByFinalAndLatePartialCannotRegressIt() {
         val reducer = TranscriptReducer("call-1")
@@ -15,6 +32,7 @@ class TranscriptReducerTest {
         assertFalse(reducer.accept(event(3, text = "hello")))
         assertEquals("hello world", reducer.lines.single().text)
         assertTrue(reducer.lines.single().isFinal)
+        assertEquals("Caller", reducer.lines.single().speakerLabel)
     }
 
     @Test fun duplicateEventIsIgnoredEvenIfPayloadChanges() {
@@ -22,6 +40,15 @@ class TranscriptReducerTest {
         reducer.accept(event())
         assertFalse(reducer.accept(event(text = "changed")))
         assertEquals("hello", reducer.lines.single().text)
+    }
+
+    @Test fun rowKeyDifferentiatesCallerAndAssistantWithSameSegmentId() {
+        val reducer = TranscriptReducer("call-1")
+        assertTrue(reducer.accept(event(sequence = 1, segment = "seg-1", speaker = "caller", text = "Hello from caller")))
+        assertTrue(reducer.accept(event(sequence = 2, segment = "seg-1", speaker = "assistant", text = "Hello from Aida")))
+        assertEquals(2, reducer.lines.size)
+        assertEquals("Caller", reducer.lines[0].speakerLabel)
+        assertEquals("Aida", reducer.lines[1].speakerLabel)
     }
 
     @Test fun outOfOrderSegmentsAreSortedWithoutOverwritingNewerText() {
