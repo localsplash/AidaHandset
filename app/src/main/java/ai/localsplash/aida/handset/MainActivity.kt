@@ -62,7 +62,6 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         store = SecureSessionStore(this)
         AlertingService.start(this)
 
@@ -86,18 +85,23 @@ class MainActivity : Activity() {
     private fun handleIntent(intent: Intent?) {
         val callId = intent?.getStringExtra("EXTRA_CALL_ID") ?: return
         val shouldTakeover = intent.getBooleanExtra("EXTRA_ACTION_TAKEOVER", false)
-        Log.i(TAG, "handleIntent: callId=$callId, shouldTakeover=$shouldTakeover")
-        selectedCallId = callId
+        Log.i(TAG, "handleIntent: callId=$callId, shouldTakeover=$shouldTakeover, selectedCallId=$selectedCallId")
         scope.launch {
             val calls = AlertingService.activeCalls.value
             val target = calls.find { it.id == callId }
             if (target != null) {
-                openCall(target)
+                if (selectedCallId != callId || selectedCall == null) {
+                    openCall(target)
+                }
                 if (shouldTakeover) {
                     executeTakeover(target)
                 }
             } else {
-                fetchAndOpenCall(callId, shouldTakeover)
+                if (selectedCallId != callId || selectedCall == null) {
+                    fetchAndOpenCall(callId, shouldTakeover)
+                } else if (shouldTakeover) {
+                    selectedCall?.let { executeTakeover(it) }
+                }
             }
         }
     }
@@ -105,7 +109,7 @@ class MainActivity : Activity() {
     private fun observeIncomingAlerts() {
         scope.launch {
             AlertingService.incomingAlertCall.collect { callId ->
-                if (selectedCallId == null || selectedCallId == callId) {
+                if (selectedCallId == null) {
                     selectedCallId = callId
                     fetchAndOpenCall(callId)
                 }
@@ -476,11 +480,16 @@ class MainActivity : Activity() {
         detailContainer.addView(gapNoticeView)
 
         // Transcript Scroll View
-        transcriptView = label("Connecting to Aida…", 20f).apply {
+        transcriptView = TextView(this).apply {
+            textSize = 20f
+            setTextColor(Color.rgb(28, 41, 57))
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             setTextIsSelectable(true)
-            setLineSpacing(0f, 1.2f)
+            setLineSpacing(0f, 1.25f)
+            text = "Connecting to Aida…"
         }
         transcriptScroll = ScrollView(this).apply {
+            setBackgroundColor(Color.rgb(245, 247, 250))
             addView(transcriptView)
             setOnScrollChangeListener { _, _, scrollY, _, _ ->
                 val child = getChildAt(0)
@@ -491,7 +500,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        detailContainer.addView(transcriptScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        detailContainer.addView(transcriptScroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { setMargins(0, dp(4), 0, 0) })
 
         updateCallState(call)
         updateTranscriptUI()
@@ -606,12 +615,32 @@ class MainActivity : Activity() {
         if (lines.isEmpty()) {
             transcriptView?.text = "Waiting for speech…"
         } else {
-            val formatted = lines.joinToString("\n\n") { line ->
-                val speakerLabel = line.speakerLabel
+            val builder = android.text.SpannableStringBuilder()
+            for (i in lines.indices) {
+                val line = lines[i]
+                if (i > 0) builder.append("\n\n")
+
+                val speakerLabel = "${line.speakerLabel}: "
+                val startSpeaker = builder.length
+                builder.append(speakerLabel)
+                val endSpeaker = builder.length
+
+                val speakerColor = if (line.speakerLabel == "Aida") {
+                    Color.rgb(21, 101, 192) // Distinct blue for Assistant
+                } else {
+                    Color.rgb(46, 125, 50)  // Distinct green for Caller
+                }
+                builder.setSpan(android.text.style.StyleSpan(Typeface.BOLD), startSpeaker, endSpeaker, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                builder.setSpan(android.text.style.ForegroundColorSpan(speakerColor), startSpeaker, endSpeaker, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+
+                val textStart = builder.length
                 val finalMark = if (line.isFinal) "" else " …"
-                "$speakerLabel: ${line.text}$finalMark"
+                builder.append("${line.text}$finalMark")
+                val textEnd = builder.length
+                val textColor = if (line.isFinal) Color.rgb(28, 41, 57) else Color.rgb(100, 116, 139)
+                builder.setSpan(android.text.style.ForegroundColorSpan(textColor), textStart, textEnd, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
-            transcriptView?.text = formatted
+            transcriptView?.text = builder
         }
 
         if (autoScroll) {
