@@ -2,33 +2,134 @@ package ai.localsplash.aida.handset
 
 import kotlinx.serialization.Serializable
 
-@Serializable data class Device(val id: String, val iTenantId: Long, val extensionId: String)
-@Serializable data class Enrollment(val token: String, val device: Device)
-@Serializable data class EnrollmentRequest(val enrollmentToken: String, val deviceId: String)
-@Serializable data class Call(
-    val id: String,
-    val status: String,
-    val version: Long,
-    val caller: String? = null,
-    val startedAt: String? = null,
-    val extensionId: String? = null,
+@Serializable
+data class AttachRequest(
+    val appInstanceId: String,
+    val localIps: List<String>,
+    val deviceModel: String,
+    val claimedMac: String? = null,
 )
-@Serializable data class CallsResponse(val calls: List<Call>)
-@Serializable data class LiveKitSession(val url: String, val token: String)
-@Serializable data class CallDetail(val call: Call, val livekit: LiveKitSession? = null)
-@Serializable data class Command(
-    val commandType: String = "TAKEOVER",
+
+@Serializable
+data class Device(
+    val id: String,
+    val pbxInstanceId: String,
+    val context: String,
+    val endpointId: String,
+    val extension: String,
+    val label: String? = null,
+)
+
+@Serializable
+data class AttachResponse(
+    val token: String,
+    val expiresAt: String? = null,
+    val device: Device,
+)
+
+@Serializable
+data class AttachErrorResponse(
+    val error: String,
+    val message: String? = null,
+    val sentIps: List<String> = emptyList(),
+    val publicIpSeen: String? = null,
+    val reason: String? = null,
+)
+
+@Serializable
+data class QueueInfo(
+    val name: String,
+    val channel: String,
+)
+
+@Serializable
+data class PusherConfig(
+    val key: String,
+    val cluster: String,
+)
+
+@Serializable
+data class HandsetMeResponse(
+    val device: Device,
+    val queues: List<QueueInfo> = emptyList(),
+    val pusher: PusherConfig? = null,
+)
+
+@Serializable
+data class Call(
+    val id: String,
+    val state: String,
+    val version: Long,
+    val queue: String,
+    val callerNumber: String? = null,
+    val startedAt: String? = null,
+)
+
+@Serializable
+data class CallsResponse(
+    val calls: List<Call> = emptyList(),
+)
+
+@Serializable
+data class TakeoverInfo(
+    val status: String,
+    val reason: String? = null,
+    val mine: Boolean = false,
+)
+
+@Serializable
+data class LiveKitSession(
+    val url: String,
+    val token: String,
+    val expiresIn: Long? = null,
+)
+
+@Serializable
+data class CallDetail(
+    val call: Call,
+    val agentParticipantSid: String? = null,
+    val takeover: TakeoverInfo? = null,
+    val livekit: LiveKitSession? = null,
+)
+
+@Serializable
+data class TakeoverRequest(
     val idempotencyKey: String,
     val expectedCallVersion: Long,
 )
-@Serializable data class PendingCommand(val callId: String, val command: Command)
-@Serializable data class DeviceSession(
+
+@Serializable
+data class TakeoverResponse(
+    val status: String,
+)
+
+@Serializable
+data class PendingTakeover(
+    val callId: String,
+    val idempotencyKey: String,
+    val expectedCallVersion: Long,
+)
+
+@Serializable
+data class DeviceSession(
     val serverUrl: String,
     val token: String,
+    val expiresAt: String? = null,
     val device: Device,
-    val pending: PendingCommand? = null,
+    val pendingTakeover: PendingTakeover? = null,
 )
-@Serializable data class TranscriptEvent(
+
+@Serializable
+data class PusherCallEvent(
+    val v: Int = 1,
+    val eventId: String? = null,
+    val callSessionId: String,
+    val state: String,
+    val occurredAt: String? = null,
+)
+
+@Serializable
+data class TranscriptEvent(
     val type: String,
     val callId: String,
     val eventId: String,

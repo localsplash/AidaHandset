@@ -1,89 +1,91 @@
 # AidaHandset
 
-Android 11+ data and control app for a Grandstream GXV3450 office handset. The phone's native SIP client owns call audio; this app pairs to an extension, lists its active calls, displays LiveKit transcript data, and requests a takeover through OfficePulse.
+Android 11+ companion and call takeover app for the Grandstream GXV3450 office handset. The phone's native SIP client owns call audio; this app identifies its extension from the phone's live SIP registration, listens for queue alerts via Pusher through a persistent foreground service, displays LiveKit transcript data, and initiates one-tap call takeovers with auto-answer through OfficePulse.
 
 ## Responsibilities
 
-- Pair to one business extension using an administrator-issued, one-time enrollment code.
-- Poll authorized calls every five seconds while visible; select any simultaneous call for live text.
-- Fetch call-specific LiveKit credentials from OfficePulse. No provider, database or SIP credentials belong in this app.
-- Replace partial text with final segments, ignore duplicate/stale events, order segments by stream sequence, and visibly mark missed events and agent restarts.
-- Persist a pending takeover request before sending it. A retry after an unknown outcome reuses its original idempotency key and call version, including after process death.
+- **Automatic attach:** On first run, reads its local IPv4 addresses and identifies its extension by matching Asterisk's live SIP registration (`asterisk.ps_contacts`). No pairing codes or manual MAC entry required.
+- **Always-on alerting:** A foreground service starts at boot and maintains a persistent Pusher connection to queue channels. Incoming calls in `screening` state trigger a full-screen alert bringing the app to the front.
+- **Live transcripts:** Early-join data connection to the call's LiveKit room (`autoSubscribe=false`, `NoAudioHandler`), buffering early speech until the agent SID is resolved and streaming caller and Aida utterances.
+- **One-tap takeover:** Single tap on **Take over** requests an auto-answered transfer to the handset's extension. Retries reuse a Keystore-persisted idempotency key.
+- **Simultaneous calls:** Displays active calls across queues with per-call transcript buffers capped at 200 segments.
 
 ## Stack
 
-Kotlin, native Android views, Android Keystore, OkHttp, LiveKit Android SDK, GitHub Actions. AGP 8.7.3, Gradle 8.9, Kotlin 2.1.10 and LiveKit 2.20.3 are pinned. The Gradle wrapper verifies the official distribution checksum; JitPack is restricted to LiveKit's pinned AudioSwitch dependency.
+Kotlin, native Android views, Android Keystore, OkHttp, LiveKit Android SDK (`2.20.3`), Pusher Java Client (`2.4.4`), Gradle 8.9, AGP 8.7.3, Kotlin 2.1.10.
 
-## Build and install
+## How the phone is recognised
 
-Install JDK 17 and Android SDK 35, accept the SDK licenses, and set `ANDROID_HOME` (or create a local `local.properties` with `sdk.dir=...`). Then:
+The phone registers to Asterisk over SIP, so Asterisk knows the link between the device's LAN IP and its extension:
 
-```sh
-./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+asterisk.ps_contacts: endpoint = 411
+  uri      = sip:411@172.116.149.216:39314;transport=TLS;x-ast-orig-host=192.168.6.97:5060
+  via_addr = 192.168.6.97
 ```
 
-The debug APK is for local POC testing. Configure your own signing key for a distributable release; signing keys must stay outside Git. CI produces the debug APK as a workflow artifact.
+On first run, the app calls `POST /v1/handset/attach` with its local IPv4 addresses (`NetworkInterface.getInetAddresses`). OfficePulse matches them against active registrations:
+- The HTTP request's public IP matches the registration IP.
+- One of the app's reported LAN addresses matches the contact's `via_addr`.
+- Exactly one unexpired contact matches.
+The matched endpoint becomes the handset's extension, and OfficePulse issues a device token stored in the Android Keystore.
 
-Open the app and enter the HTTPS **OfficePulse public API origin**, defaulting to `https://aida-api.localsplash.dev`, followed by a one-time enrollment code created for the desired business extension in Aida Admin. In the development composition, Nginx Proxy Manager forwards this origin to host port `18085` (OfficePulse's public listener on container port `8086`) and serves a certificate the Android device trusts. The private provisioning listener on `8085` stays inside the Docker network. There is no web container to deploy for this Android app.
+## GXV3450 auto-answer configuration
 
-The app uses the server's assigned tenant and extension. It has no tenant override or SUPER ADMIN mode; central Identity manages the humans using Aida Admin, and OfficePulse authorizes the resulting scoped device token. Revoke enrolled devices in Aida Admin. Local Unpair removes the local encrypted session but does not revoke the server token.
+Takeovers use an Asterisk originate with a dedicated `Call-Info: <sip:127.0.0.1>;answer-after=0` header. The Grandstream GXV3450 must be provisioned to auto-answer only INVITEs bearing this header:
+
+In the device web UI:
+**Account 1 → Call Settings → Auto Answer = "Intercom/Paging Only"**
+
+In the device provisioning template (`/var/www/provisioning/cfg<MAC>.xml`):
+
+| P-value | Parameter | Setting | Description |
+| --- | --- | --- | --- |
+| `P2981` | Auto Answer | `1` | Enable auto answer |
+| `P2862` | Auto Answer Mode | `3` | Speakerphone |
+| `P2863` | Mute on Intercom Auto Answer | `0` | Unmuted two-way audio immediately upon answer |
+| `P2983` | Auto Answer Call Waiting | `0` | Do not barge in if phone is already on a call |
+| `P2860` | Intercom Barging | `0` | Prevent takeover barge-in |
 
 ## OfficePulse contract
 
-All routes are relative to the configured origin. Enrollment is the only unauthenticated route; all other requests carry `Authorization: Bearer <device token>`. The server must enforce device revocation, tenant/extension access, optimistic concurrency, and command idempotency.
+All routes are relative to `https://officepulse-api.localsplash.dev`. Every request except `attach` sends `Authorization: Bearer <device token>`.
 
-| Request | Body / response |
-| --- | --- |
-| `POST /v1/devices/enroll` | Send `{enrollmentToken, deviceId}`; receive `{token, device:{id, iTenantId, extensionId}}`. `iTenantId` is an integer; IDs and extension ID are strings. |
-| `GET /v1/calls` | Receive `{calls:[{id,status,version,caller?,startedAt?,extensionId?}]}` scoped to the enrolled extension. |
-| `GET /v1/calls/:id` | Receive `{call:{id,status,version,caller?,startedAt?,extensionId?},livekit?:{url,token}}`. LiveKit URL uses `wss://`. |
-| `POST /v1/calls/:id/commands` | Send `{commandType:"TAKEOVER",idempotencyKey,expectedCallVersion}`; any successful HTTP response means the request was accepted, not that the SIP handoff completed. |
+| Route | Method | Description |
+| --- | --- | --- |
+| `/v1/handset/attach` | POST | `{appInstanceId, localIps:[...], deviceModel, claimedMac?}`. Returns `{token, expiresAt, device}`. |
+| `/v1/handset/me` | GET | Returns `{device, queues:[{name, channel}], pusher:{key, cluster}}`. |
+| `/v1/handset/calls` | GET | Active calls on the handset's queues: `{calls:[{id, state, version, queue, callerNumber?, startedAt}]}`. |
+| `/v1/handset/calls/{id}` | GET | `{call, agentParticipantSid?, takeover?, livekit:{url, token, expiresIn}}`. |
+| `/v1/handset/calls/{id}/takeover` | POST | `{idempotencyKey, expectedCallVersion}`. Returns 202 `{status:"ringing"}`. |
+| `/v1/handset/logout` | POST | Revokes current device token. |
 
-LiveKit reliable data packets use topic `transcript` (a missing topic is accepted for compatibility):
-
+### Pusher alerts
+The app subscribes to public queue channels (`aida;{pbxInstanceId};{context};{queue}`) and listens for the `call` event:
 ```json
-{
-  "type": "transcript",
-  "callId": "call-id",
-  "eventId": "unique-event-id",
-  "streamId": "agent-connection-id",
-  "sequence": 1,
-  "segmentId": "utterance-id",
-  "text": "How can I help?",
-  "isFinal": false,
-  "timestamp": "2026-09-06T12:00:00Z",
-  "speaker": "Assistant"
-}
+{"v":1,"eventId":"...","callSessionId":"...","state":"screening","occurredAt":"..."}
 ```
 
-Sequences start at one and increase per stream. A new agent connection must use a new `streamId`. Finals are immutable; partials use the same `segmentId` until finalization. The handset rejects packets for other calls. OfficePulse/LiveKit must ensure only authorized server agents can publish into a call room and issue handset tokens with publishing disabled.
+### LiveKit transcripts
+Reliable data on topic `transcript`:
+```json
+{"type":"transcript","callId":"...","eventId":"...","streamId":"...","sequence":1,"segmentId":"...","text":"...","isFinal":false,"timestamp":"...","speaker":"caller"}
+```
+- `speaker` is `caller` or `assistant` (lowercase).
+- Row key is `streamId:speaker:segmentId`. Higher `sequence` replaces partial, and final is immutable.
+- Transcripts are held in memory only, capped at 200 segments, and never written to disk, logs or notifications.
 
-## Recovery and security
+## Build and install
 
-- Tokens and pending commands are AES-GCM encrypted using an Android Keystore key and private preferences. Backups and screenshots are disabled. Enrollment codes are neither persisted nor logged.
-- Only HTTPS origins without userinfo, paths, query strings or fragments are accepted. Redirects and automatic HTTP retries are disabled; credentials must never follow a redirect. Tokens are never placed in URLs by this app.
-- `401` or `403` disconnects LiveKit, clears the transcript and encrypted local session, and asks for fresh enrollment. A stale call (`409`) requires a deliberate retry after refreshing; timeouts and server failures retain the pending request. The Pending request button can explicitly clear an unresolved retry after checking the phone, including when its call has ended.
-- LiveKit uses `NoAudioHandler`, disables its silent-audio workaround, and connects with audio, video and automatic track subscriptions disabled. Microphone and camera permissions are removed from the merged manifest.
-- Polling and LiveKit stop while the activity is hidden. Returning reconnects and marks a possible transcript gap. Transcript text is held in memory only and limited to the latest 500 segments.
+Install JDK 17 and Android SDK 35 (API 30 minimum).
 
-There is **no transcript history/replay** in this initial contract. Opening a call late, losing connection, restarting an agent, or restarting the app can leave gaps; the UI says so. Pusher/background notifications, a kiosk/device-management policy, and verified end-to-end SIP handoff on a physical GXV3450 are follow-up work. A successful unit/build check does not establish PBX or hardware integration.
+```sh
+./gradlew testDebugUnitTest lintDebug assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
-## White labeling
-
-Change `app/src/main/res/values/strings.xml` for the displayed app name and default server URL. Set your own `applicationId` in `app/build.gradle.kts` when distributing an independently branded APK. The runtime server URL remains configurable in the enrollment screen.
-
-## SDK references
-
-- [Android Gradle Plugin 8.7 compatibility](https://developer.android.com/build/releases/agp-8-7-0-release-notes)
-- [Pinned LiveKit connection options](https://github.com/livekit/client-sdk-android/blob/v2.20.3/livekit-android-sdk/src/main/java/io/livekit/android/ConnectOptions.kt)
-- [Pinned LiveKit audio overrides](https://github.com/livekit/client-sdk-android/blob/v2.20.3/livekit-android-sdk/src/main/java/io/livekit/android/LiveKitOverrides.kt)
-- [Android Keystore](https://developer.android.com/privacy-and-security/keystore)
-
-## System specification
-
-[Canonical Aida Voice Platform specification](https://github.com/localsplash/AidaInfrastructureSetupInstructions/blob/main/docs/AIDA_VOICE_PLATFORM_TECHNICAL_SPECIFICATION.md)
-
-## Project invariant
-
-The handset never stores or transmits the Asterisk SIP password.
+To connect via ADB to the GXV3450 desk phone over LAN:
+1. On the phone or web UI, navigate to **Settings → System Security → Developer Mode** and enable it.
+2. Run `adb connect <phone-ip>:5555`.
+3. Tap **OK** on the phone prompt (*"Allow USB debugging?"*) and check *"Always allow from this computer"*.
+4. Run `adb install -r app/build/outputs/apk/debug/app-debug.apk`.
