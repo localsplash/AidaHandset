@@ -1,6 +1,7 @@
 package ai.localsplash.aida.handset
 
 import android.content.Context
+import android.util.Log
 import io.livekit.android.AudioOptions
 import io.livekit.android.ConnectOptions
 import io.livekit.android.LiveKit
@@ -14,14 +15,30 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 
+@OptIn(io.livekit.android.annotations.Beta::class)
 class LiveTranscript(private val context: Context, private val scope: CoroutineScope) {
     private var room: Room? = null
     private var events: Job? = null
     @Volatile private var expectedCallId: String? = null
     @Volatile private var boundAgentSid: String? = null
     private val pendingBuffer = Collections.synchronizedList(mutableListOf<Pair<String?, TranscriptEvent>>())
+    private val streamSequenceCounters = Collections.synchronizedMap(mutableMapOf<String, Long>())
     private var onEventCallback: ((TranscriptEvent) -> Unit)? = null
+
+    private fun nextSequence(streamId: String): Long {
+        return synchronized(streamSequenceCounters) {
+            val current = streamSequenceCounters[streamId] ?: 0L
+            val next = current + 1L
+            streamSequenceCounters[streamId] = next
+            next
+        }
+    }
 
     suspend fun connect(
         callId: String,
@@ -30,12 +47,20 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
         onEvent: (TranscriptEvent) -> Unit,
         onState: (String, Boolean) -> Unit,
     ) {
-        require(session.url.startsWith("wss://")) { "LiveKit must use a secure wss:// URL." }
+        val wsUrl = when {
+            session.url.startsWith("https://") -> "wss://" + session.url.removePrefix("https://")
+            session.url.startsWith("http://") -> "ws://" + session.url.removePrefix("http://")
+            else -> session.url
+        }
+        require(wsUrl.startsWith("wss://") || wsUrl.startsWith("ws://")) { "LiveKit URL must be a ws:// or wss:// URL: ${session.url}" }
         close()
         expectedCallId = callId
         boundAgentSid = agentParticipantSid
         onEventCallback = onEvent
         pendingBuffer.clear()
+        streamSequenceCounters.clear()
+
+        Log.i(TAG, "Connecting to LiveKit: url=$wsUrl (orig=${session.url}), callId=$callId, boundAgentSid=$agentParticipantSid")
 
         val joined = LiveKit.create(
             context.applicationContext,
@@ -47,23 +72,79 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
         events = scope.launch(start = CoroutineStart.UNDISPATCHED) {
             joined.events.collect { event ->
                 when (event) {
-                    is RoomEvent.DataReceived -> if (event.data.size <= 65536 && (event.topic == "transcript" || event.topic == null)) {
-                        val parsed = runCatching { PlatformApi.json.decodeFromString<TranscriptEvent>(event.data.toString(Charsets.UTF_8)) }.getOrNull()
-                        if (parsed != null && parsed.callId == expectedCallId) {
-                            handleDataPacket(event.participant?.sid?.value, parsed)
+                    is RoomEvent.Connected -> {
+                        Log.i(TAG, "Room Connected: ${joined.name}")
+                        onState("Live transcript connected", false)
+                    }
+                    is RoomEvent.Reconnecting -> {
+                        Log.w(TAG, "Room Reconnecting: ${joined.name}")
+                        onState("Reconnecting transcript…", true)
+                    }
+                    is RoomEvent.Reconnected -> {
+                        Log.i(TAG, "Room Reconnected: ${joined.name}")
+                        onState("Live transcript reconnected", true)
+                    }
+                    is RoomEvent.Disconnected -> {
+                        Log.w(TAG, "Room Disconnected: ${joined.name}, error: ${event.error}")
+                        onState("Transcript disconnected.", true)
+                    }
+                    is RoomEvent.FailedToConnect -> {
+                        val msg = event.error?.message ?: "Connection failed"
+                        Log.e(TAG, "Room FailedToConnect: ${joined.name}, error: $msg", event.error)
+                        onState("Transcript unavailable: $msg", true)
+                    }
+                    is RoomEvent.TranscriptionReceived -> {
+                        val participant = event.participant
+                        val identity = participant?.identity?.value.orEmpty()
+                        Log.i(TAG, "TranscriptionReceived from $identity: ${event.transcriptionSegments.size} segments")
+                        val speakerName = if (identity.contains("agent", ignoreCase = true) || identity.contains("assistant", ignoreCase = true)) {
+                            "assistant"
+                        } else if (identity.contains("caller", ignoreCase = true) || identity.contains("sip", ignoreCase = true)) {
+                            "caller"
+                        } else {
+                            identity.ifEmpty { participant?.name ?: "assistant" }
+                        }
+                        val streamId = participant?.sid?.value ?: "stream-0"
+                        for (seg in event.transcriptionSegments) {
+                            val seq = nextSequence(streamId)
+                            val ev = TranscriptEvent(
+                                type = "transcript",
+                                callId = expectedCallId.orEmpty(),
+                                eventId = "$streamId-${seg.id}-$seq",
+                                streamId = streamId,
+                                sequence = seq,
+                                segmentId = seg.id,
+                                text = seg.text,
+                                isFinal = seg.final,
+                                timestamp = seg.lastReceivedTime.toString(),
+                                speaker = speakerName,
+                            )
+                            Log.i(TAG, "TranscriptionSegment from $speakerName ($identity) [final=${seg.final}, seq=$seq]: ${seg.text}")
+                            handleDataPacket(participant?.sid?.value, ev)
                         }
                     }
-                    is RoomEvent.Connected -> onState("Live transcript connected", false)
-                    is RoomEvent.Reconnecting -> onState("Reconnecting transcript…", true)
-                    is RoomEvent.Reconnected -> onState("Live transcript reconnected", true)
-                    is RoomEvent.Disconnected -> onState("Transcript disconnected.", true)
-                    is RoomEvent.FailedToConnect -> onState("Transcript unavailable.", true)
+                    is RoomEvent.DataReceived -> if (event.data.size <= 65536) {
+                        val rawStr = event.data.toString(Charsets.UTF_8)
+                        val senderSid = event.participant?.sid?.value
+                        Log.i(TAG, "DataReceived from $senderSid topic=${event.topic}: $rawStr")
+                        val parsed = parseDataPacket(rawStr, expectedCallId)
+                        if (parsed != null) {
+                            handleDataPacket(senderSid, parsed)
+                        } else {
+                            Log.w(TAG, "Could not parse data packet: $rawStr")
+                        }
+                    }
                     else -> Unit
                 }
             }
         }
         // No local tracks; no automatic remote media subscriptions. The phone's SIP client owns audio.
-        joined.connect(session.url, session.token, ConnectOptions(autoSubscribe = false, audio = false, video = false))
+        try {
+            joined.connect(wsUrl, session.token, ConnectOptions(autoSubscribe = false, audio = false, video = false))
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception during joined.connect: ${e.message}", e)
+            onState("Transcript connection error: ${e.message}", true)
+        }
     }
 
     fun updateAgentParticipantSid(sid: String) {
@@ -78,30 +159,105 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
     }
 
     private fun handleDataPacket(senderSid: String?, event: TranscriptEvent) {
-        val targetCallback = onEventCallback ?: return
+        val targetCallback = onEventCallback ?: run {
+            Log.w(TAG, "No callback registered for event: ${event.text}")
+            return
+        }
         val currentSid = boundAgentSid
-        if (currentSid == null) {
-            // Early join: buffer packets until agentParticipantSid is bound
+        Log.d(TAG, "handleDataPacket: senderSid=$senderSid, boundAgentSid=$currentSid, speaker=${event.speaker}, text='${event.text}'")
+        // If an explicit agent SID is configured, filter by it; otherwise deliver immediately!
+        if (currentSid == null || senderSid == null || senderSid == currentSid) {
+            targetCallback(event)
+        } else {
+            // Buffer in case SID binding is updated
             synchronized(pendingBuffer) {
                 if (pendingBuffer.size < 100) {
                     pendingBuffer.add(senderSid to event)
                 }
             }
-        } else if (senderSid == currentSid) {
-            targetCallback(event)
+        }
+    }
+
+    private fun parseDataPacket(raw: String, expectedCallId: String?): TranscriptEvent? {
+        val strict = runCatching { PlatformApi.json.decodeFromString<TranscriptEvent>(raw) }.getOrNull()
+        if (strict != null && strict.text.isNotBlank()) {
+            val sid = strict.streamId.ifBlank { "stream-0" }
+            val seq = if (strict.sequence > 0) strict.sequence else nextSequence(sid)
+            return strict.copy(
+                callId = strict.callId.ifBlank { expectedCallId.orEmpty() },
+                streamId = sid,
+                sequence = seq,
+                segmentId = strict.segmentId.ifBlank { "seg-$sid-$seq" },
+                eventId = strict.eventId.ifBlank { "ev-$sid-$seq" },
+            )
+        }
+
+        return try {
+            val element = PlatformApi.json.parseToJsonElement(raw)
+            val obj = (element as? JsonObject) ?: return null
+            val text = obj["text"]?.jsonPrimitive?.contentOrNull
+                ?: obj["transcript"]?.jsonPrimitive?.contentOrNull
+                ?: obj["content"]?.jsonPrimitive?.contentOrNull
+                ?: return null
+            if (text.isBlank()) return null
+
+            val speaker = obj["speaker"]?.jsonPrimitive?.contentOrNull
+                ?: obj["role"]?.jsonPrimitive?.contentOrNull
+                ?: obj["participant"]?.jsonPrimitive?.contentOrNull
+            val isFinal = obj["isFinal"]?.jsonPrimitive?.booleanOrNull
+                ?: obj["is_final"]?.jsonPrimitive?.booleanOrNull
+                ?: obj["final"]?.jsonPrimitive?.booleanOrNull
+                ?: false
+            val streamId = obj["streamId"]?.jsonPrimitive?.contentOrNull
+                ?: obj["stream_id"]?.jsonPrimitive?.contentOrNull
+                ?: "stream-0"
+            val rawSeq = obj["sequence"]?.jsonPrimitive?.longOrNull ?: 0L
+            val seq = if (rawSeq > 0) rawSeq else nextSequence(streamId)
+            val segmentId = obj["segmentId"]?.jsonPrimitive?.contentOrNull
+                ?: obj["segment_id"]?.jsonPrimitive?.contentOrNull
+                ?: obj["id"]?.jsonPrimitive?.contentOrNull
+                ?: "seg-$streamId-$seq"
+            val callId = obj["callId"]?.jsonPrimitive?.contentOrNull
+                ?: obj["call_id"]?.jsonPrimitive?.contentOrNull
+                ?: expectedCallId.orEmpty()
+            val eventId = obj["eventId"]?.jsonPrimitive?.contentOrNull
+                ?: obj["event_id"]?.jsonPrimitive?.contentOrNull
+                ?: "ev-$streamId-$seq"
+
+            TranscriptEvent(
+                type = "transcript",
+                callId = callId,
+                eventId = eventId,
+                streamId = streamId,
+                sequence = seq,
+                segmentId = segmentId,
+                text = text,
+                isFinal = isFinal,
+                timestamp = System.currentTimeMillis().toString(),
+                speaker = speaker,
+            )
+        } catch (_: Exception) {
+            null
         }
     }
 
     fun close() {
         events?.cancel()
         events = null
-        room?.disconnect()
-        room?.release()
+        try {
+            room?.disconnect()
+            room?.release()
+        } catch (_: Exception) {}
         room = null
         expectedCallId = null
         boundAgentSid = null
         onEventCallback = null
         pendingBuffer.clear()
+        streamSequenceCounters.clear()
+    }
+
+    companion object {
+        private const val TAG = "LiveTranscript"
     }
 }
 

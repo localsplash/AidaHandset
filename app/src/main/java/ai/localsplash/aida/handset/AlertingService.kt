@@ -202,26 +202,43 @@ class AlertingService : Service() {
     }
 
     private fun showFullScreenAlertNotification(callId: String, caller: String) {
-        val notifyIntent = Intent(this, MainActivity::class.java).apply {
+        // Tapping the banner body opens MainActivity to view the live transcription
+        val openTranscriptIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra("EXTRA_CALL_ID", callId)
         }
         val fullScreenPendingIntent = PendingIntent.getActivity(
             this,
             callId.hashCode(),
-            notifyIntent,
+            openTranscriptIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        // Tapping the explicit "Take Over" action button triggers immediate takeover
+        val takeoverIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra("EXTRA_CALL_ID", callId)
+            putExtra("EXTRA_ACTION_TAKEOVER", true)
+        }
+        val takeoverPendingIntent = PendingIntent.getActivity(
+            this,
+            (callId + "_takeover").hashCode(),
+            takeoverIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
         val notification = NotificationCompat.Builder(this, CHANNEL_CALLS)
             .setSmallIcon(R.drawable.ic_handset)
             .setContentTitle("Incoming Aida Call: $caller")
-            .setContentText("Aida is screening an incoming call. Tap to take over.")
+            .setContentText("Screening · Tap to view live transcript")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setAutoCancel(true)
             .setFullScreenIntent(fullScreenPendingIntent, true)
             .setContentIntent(fullScreenPendingIntent)
+            .addAction(R.drawable.ic_handset, "Take Over", takeoverPendingIntent)
+            .setColor(android.graphics.Color.rgb(46, 125, 50))
+            .setColorized(true)
             .build()
 
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager

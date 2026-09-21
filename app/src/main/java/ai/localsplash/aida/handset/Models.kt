@@ -140,14 +140,14 @@ data class PusherCallEvent(
 
 @Serializable
 data class TranscriptEvent(
-    val type: String,
-    val callId: String,
-    val eventId: String,
-    val streamId: String,
-    val sequence: Long,
-    val segmentId: String,
-    val text: String,
-    val isFinal: Boolean,
-    val timestamp: String,
+    val type: String = "transcript",
+    val callId: String = "",
+    val eventId: String = "",
+    val streamId: String = "",
+    val sequence: Long = 0,
+    val segmentId: String = "",
+    val text: String = "",
+    val isFinal: Boolean = false,
+    val timestamp: String = "",
     val speaker: String? = null,
 )

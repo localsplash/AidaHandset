@@ -7,6 +7,7 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.os.SystemClock
 import android.text.InputType
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -43,6 +44,7 @@ class MainActivity : Activity() {
     private var reducer: TranscriptReducer? = null
     private var foreground = false
     private var autoScroll = true
+    private val callStartTimes = mutableMapOf<String, Long>()
 
     // UI elements
     private lateinit var rootContainer: LinearLayout
@@ -83,14 +85,19 @@ class MainActivity : Activity() {
 
     private fun handleIntent(intent: Intent?) {
         val callId = intent?.getStringExtra("EXTRA_CALL_ID") ?: return
+        val shouldTakeover = intent.getBooleanExtra("EXTRA_ACTION_TAKEOVER", false)
+        Log.i(TAG, "handleIntent: callId=$callId, shouldTakeover=$shouldTakeover")
         selectedCallId = callId
         scope.launch {
             val calls = AlertingService.activeCalls.value
             val target = calls.find { it.id == callId }
             if (target != null) {
                 openCall(target)
+                if (shouldTakeover) {
+                    executeTakeover(target)
+                }
             } else {
-                fetchAndOpenCall(callId)
+                fetchAndOpenCall(callId, shouldTakeover)
             }
         }
     }
@@ -270,7 +277,11 @@ class MainActivity : Activity() {
                 isAllCaps = false
                 setBackgroundColor(if (isSelected) Color.rgb(200, 225, 255) else Color.rgb(240, 240, 240))
                 setTextColor(Color.rgb(20, 20, 20))
-                setOnClickListener { openCall(call) }
+                setOnClickListener {
+                    if (selectedCallId != call.id) {
+                        openCall(call)
+                    }
+                }
             }
             callsTabs.addView(tabBtn, LinearLayout.LayoutParams(-2, -2).apply { setMargins(0, 0, dp(8), 0) })
         }
@@ -314,10 +325,13 @@ class MainActivity : Activity() {
         } catch (_: Exception) {}
     }
 
-    private suspend fun fetchAndOpenCall(callId: String) {
+    private suspend fun fetchAndOpenCall(callId: String, shouldTakeover: Boolean = false) {
         try {
             val detail = api?.call(callId) ?: return
             openCall(detail.call)
+            if (shouldTakeover) {
+                executeTakeover(detail.call)
+            }
         } catch (_: Exception) {}
     }
 
@@ -354,11 +368,17 @@ class MainActivity : Activity() {
                     session = livekit,
                     agentParticipantSid = detail.agentParticipantSid,
                     onEvent = { event ->
-                        if (selectedCallId == call.id && reducer?.accept(event) == true) {
-                            runOnUiThread { updateTranscriptUI() }
+                        Log.i(TAG, "onEvent received: speaker=${event.speaker} seq=${event.sequence} text='${event.text}'")
+                        if (selectedCallId == call.id) {
+                            val accepted = reducer?.accept(event) == true
+                            Log.d(TAG, "reducer.accept: $accepted")
+                            if (accepted) {
+                                runOnUiThread { updateTranscriptUI() }
+                            }
                         }
                     },
                     onState = { stateMsg, interrupted ->
+                        Log.i(TAG, "onState: stateMsg='$stateMsg' interrupted=$interrupted")
                         if (selectedCallId == call.id) {
                             runOnUiThread {
                                 transcriptStateView?.text = stateMsg
@@ -402,10 +422,11 @@ class MainActivity : Activity() {
         val callerNum = call.callerNumber ?: "Caller"
         infoRow.addView(label("$callerNum  (${call.queue})", 24f).apply { setTypeface(null, Typeface.BOLD) }, LinearLayout.LayoutParams(0, -2, 1f))
 
+        val startTime = callStartTimes.getOrPut(call.id) { SystemClock.elapsedRealtime() }
         chronometerView = Chronometer(this).apply {
             textSize = 18f
             setTextColor(Color.rgb(100, 100, 100))
-            base = SystemClock.elapsedRealtime()
+            base = startTime
             start()
         }
         infoRow.addView(chronometerView)
@@ -418,13 +439,13 @@ class MainActivity : Activity() {
         }
         detailContainer.addView(stateBannerView)
 
-        // Takeover Button
+        // Takeover Button - Green styling (#2E7D32)
         takeOverBtn = Button(this).apply {
             text = "Take over"
             textSize = 20f
             setTypeface(null, Typeface.BOLD)
             minHeight = dp(64)
-            setBackgroundColor(Color.rgb(40, 120, 220))
+            setBackgroundColor(Color.rgb(46, 125, 50))
             setTextColor(Color.WHITE)
             isAllCaps = false
             setOnClickListener { executeTakeover(call) }
@@ -484,18 +505,21 @@ class MainActivity : Activity() {
             "screening" -> {
                 stateBannerView?.setBackgroundColor(Color.rgb(230, 240, 255))
                 takeOverBtn?.isEnabled = commandJob?.isActive != true
+                takeOverBtn?.setBackgroundColor(Color.rgb(46, 125, 50))
                 takeOverBtn?.text = "Take over"
             }
             "ringing" -> {
                 stateBannerView?.setBackgroundColor(Color.rgb(255, 245, 200))
                 stateBannerView?.text = "Ringing your phone…"
                 takeOverBtn?.isEnabled = false
+                takeOverBtn?.setBackgroundColor(Color.rgb(120, 120, 120))
                 takeOverBtn?.text = "Ringing your phone…"
             }
             "human-active" -> {
                 stateBannerView?.setBackgroundColor(Color.rgb(220, 255, 220))
                 stateBannerView?.text = "Connected — pick up the handset"
                 takeOverBtn?.isEnabled = false
+                takeOverBtn?.setBackgroundColor(Color.rgb(120, 120, 120))
                 takeOverBtn?.text = "Connected"
                 scope.launch {
                     delay(3000)
@@ -514,6 +538,7 @@ class MainActivity : Activity() {
 
         commandJob = scope.launch {
             takeOverBtn?.isEnabled = false
+            takeOverBtn?.setBackgroundColor(Color.rgb(120, 120, 120))
             takeOverBtn?.text = "Requesting takeover…"
             try {
                 val pending = TakeoverPolicy.prepare(call, paired.pendingTakeover)
@@ -540,6 +565,7 @@ class MainActivity : Activity() {
                 }
                 stateBannerView?.text = "Takeover failed: $reason"
                 takeOverBtn?.text = "Take over"
+                takeOverBtn?.setBackgroundColor(Color.rgb(46, 125, 50))
                 takeOverBtn?.isEnabled = true
             }
         }
@@ -550,9 +576,11 @@ class MainActivity : Activity() {
         earlyJoinJob?.cancel()
         live.close()
         chronometerView?.stop()
+        selectedCall?.id?.let { callStartTimes.remove(it) }
         stateBannerView?.text = "Call ended"
         stateBannerView?.setBackgroundColor(Color.rgb(240, 240, 240))
         takeOverBtn?.isEnabled = false
+        takeOverBtn?.setBackgroundColor(Color.rgb(180, 180, 180))
         takeOverBtn?.text = "Call ended"
         transcriptStateView?.text = "Transcript closed"
 
@@ -617,4 +645,8 @@ class MainActivity : Activity() {
         text = value; isAllCaps = false; minHeight = dp(48); setOnClickListener(action)
     }
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    companion object {
+        private const val TAG = "MainActivity"
+    }
 }

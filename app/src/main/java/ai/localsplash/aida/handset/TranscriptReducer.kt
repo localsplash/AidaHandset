@@ -36,12 +36,38 @@ class TranscriptReducer(private val callId: String, private val capacity: Int = 
         gapNotice = "Connection interrupted. Some words may be missing; transcript history is not replayed."
     }
 
+    private fun logDebug(msg: String) {
+        try {
+            android.util.Log.d("TranscriptReducer", msg)
+        } catch (_: Throwable) {}
+    }
+
     fun accept(event: TranscriptEvent): Boolean {
-        if (event.type != "transcript" || event.callId != callId || event.sequence < 1 ||
-            event.eventId.isBlank() || event.segmentId.isBlank() || event.streamId.isBlank() || event.text.length > 8192) return false
-        if (event.streamId in retiredStreams) return false
+        if (event.type != "transcript") {
+            logDebug("Rejected: type '${event.type}' != 'transcript'")
+            return false
+        }
+        if (event.callId != callId && event.callId.isNotBlank()) {
+            logDebug("Rejected: callId '${event.callId}' != '$callId'")
+            return false
+        }
+        if (event.sequence < 1) {
+            logDebug("Rejected: sequence ${event.sequence} < 1")
+            return false
+        }
+        if (event.eventId.isBlank() || event.segmentId.isBlank() || event.streamId.isBlank() || event.text.length > 8192) {
+            logDebug("Rejected: blank ids or length > 8192")
+            return false
+        }
+        if (event.streamId in retiredStreams) {
+            logDebug("Rejected: retired stream '${event.streamId}'")
+            return false
+        }
         val eventKey = "${event.streamId}:${event.eventId}"
-        if (eventKey in seen) return false
+        if (eventKey in seen) {
+            logDebug("Rejected: duplicate eventKey '$eventKey'")
+            return false
+        }
         seen.add(eventKey)
         if (seen.size > 2048) seen.remove(seen.first())
         if (event.streamId != currentStream) {
@@ -62,7 +88,10 @@ class TranscriptReducer(private val callId: String, private val capacity: Int = 
         val key = "${event.streamId}:$speaker:${event.segmentId}"
         val previous = segments[key]
         // A finalized segment is immutable; late partials and duplicate finals cannot regress it.
-        if (previous != null && (previous.isFinal || event.sequence <= previous.latestSequence)) return false
+        if (previous != null && (previous.isFinal || event.sequence <= previous.latestSequence)) {
+            logDebug("Rejected: regressed or finalized segment '$key'")
+            return false
+        }
         segments[key] = TranscriptLine(
             event.streamId,
             event.segmentId,
@@ -83,6 +112,7 @@ class TranscriptReducer(private val callId: String, private val capacity: Int = 
             }
             gapNotice = "Showing the latest $capacity transcript segments. Earlier text has been cleared from this handset."
         }
+        logDebug("Accepted segment '$key' (${if (event.isFinal) "FINAL" else "PARTIAL"}): '${event.text}'")
         return true
     }
 }
