@@ -94,25 +94,12 @@ class MainActivity : Activity() {
             val calls = AlertingService.activeCalls.value
             val target = calls.find { it.id == callId }
             if (target != null) {
-                if (selectedCallId != callId || selectedCall == null || live.currentCallId != callId || !live.isConnected) {
-                    openCall(target)
-                } else {
-                    renderCallScreen(target)
-                    updateTranscriptUI()
-                }
+                openCall(target)
                 if (shouldTakeover) {
                     executeTakeover(target)
                 }
             } else {
-                if (selectedCallId != callId || selectedCall == null || live.currentCallId != callId || !live.isConnected) {
-                    fetchAndOpenCall(callId, shouldTakeover)
-                } else {
-                    selectedCall?.let {
-                        renderCallScreen(it)
-                        updateTranscriptUI()
-                        if (shouldTakeover) executeTakeover(it)
-                    }
-                }
+                fetchAndOpenCall(callId, shouldTakeover)
             }
         }
     }
@@ -412,10 +399,9 @@ class MainActivity : Activity() {
 
     private fun openCall(call: Call, reconnect: Boolean = false) {
         AlertingService.dismissCallAlert(this)
+        val callChanged = selectedCallId != call.id
         selectedCallId = call.id
         selectedCall = call
-        loadingCall?.cancel()
-        earlyJoinJob?.cancel()
 
         if (reducer == null || reducer?.callId != call.id) {
             reducer = TranscriptReducer(call.id, capacity = 200)
@@ -424,16 +410,23 @@ class MainActivity : Activity() {
         }
 
         renderCallScreen(call)
+        updateTranscriptUI()
 
-        if (!reconnect && live.currentCallId == call.id && live.isConnected) {
-            updateTranscriptUI()
+        // If already connected to or actively loading this call, keep the existing session intact
+        if (!reconnect && !callChanged && (live.currentCallId == call.id && (live.isConnected || loadingCall?.isActive == true))) {
+            Log.i(TAG, "openCall: already connected or loading call ${call.id}, keeping existing session")
             return
         }
 
-        live.close()
+        loadingCall?.cancel()
+        earlyJoinJob?.cancel()
+        if (callChanged || reconnect) {
+            live.close()
+        }
 
         loadingCall = scope.launch {
             try {
+                transcriptStateView?.text = "Connecting live transcript…"
                 val detail = api?.call(call.id) ?: return@launch
                 selectedCall = detail.call
                 updateCallState(detail.call)

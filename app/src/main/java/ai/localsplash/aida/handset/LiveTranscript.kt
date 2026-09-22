@@ -58,6 +58,12 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
             else -> session.url
         }
         require(wsUrl.startsWith("wss://") || wsUrl.startsWith("ws://")) { "LiveKit URL must be a ws:// or wss:// URL: ${session.url}" }
+        if (expectedCallId == callId && isConnected) {
+            Log.i(TAG, "Already connected to callId=$callId, updating callbacks")
+            onEventCallback = onEvent
+            onState("Live transcript connected", false)
+            return
+        }
         close()
         expectedCallId = callId
         boundAgentSid = agentParticipantSid
@@ -113,7 +119,7 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
                         } else {
                             identity.ifEmpty { participant?.name ?: "assistant" }
                         }
-                        val streamId = participant?.sid?.value ?: "stream-0"
+                        val streamId = expectedCallId?.ifBlank { "stream-0" } ?: "stream-0"
                         for (seg in event.transcriptionSegments) {
                             val seq = nextSequence(streamId)
                             val ev = TranscriptEvent(
@@ -204,6 +210,14 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
         return try {
             val element = PlatformApi.json.parseToJsonElement(raw)
             val obj = (element as? JsonObject) ?: return null
+            val type = obj["type"]?.jsonPrimitive?.contentOrNull
+            if (type == "aida.event.agent_ready") {
+                val sid = obj["agentParticipantSid"]?.jsonPrimitive?.contentOrNull
+                if (!sid.isNullOrBlank()) {
+                    updateAgentParticipantSid(sid)
+                }
+                return null
+            }
             val text = obj["text"]?.jsonPrimitive?.contentOrNull
                 ?: obj["transcript"]?.jsonPrimitive?.contentOrNull
                 ?: obj["content"]?.jsonPrimitive?.contentOrNull
