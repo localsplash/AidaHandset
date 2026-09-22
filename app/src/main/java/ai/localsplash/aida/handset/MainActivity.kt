@@ -674,25 +674,72 @@ class MainActivity : Activity() {
             takeOverBtn?.setBackgroundColor(Color.rgb(120, 120, 120))
             takeOverBtn?.text = "Requesting takeover…"
             try {
-                val pending = TakeoverPolicy.prepare(call, paired.pendingTakeover)
+                // Refresh call version directly from the server to avoid sending a stale version from initial alert
+                val currentCall = try {
+                    val refreshed = api?.call(call.id)?.call
+                    if (refreshed != null) {
+                        selectedCall = refreshed
+                        refreshed
+                    } else {
+                        call
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to refresh call before takeover, using cached call: ${e.message}")
+                    call
+                }
+
+                if (currentCall.state != "screening") {
+                    updateCallState(currentCall)
+                    return@launch
+                }
+
+                val pending = TakeoverPolicy.prepare(currentCall, paired.pendingTakeover)
                 val savedSession = paired.copy(pendingTakeover = pending)
                 store.save(savedSession)
                 session = savedSession
 
-                val resp = api?.takeover(call.id, TakeoverRequest(pending.idempotencyKey, pending.expectedCallVersion))
+                Log.i(TAG, "Sending takeover request: callId=${currentCall.id}, version=${pending.expectedCallVersion}, key=${pending.idempotencyKey}")
+                val resp = api?.takeover(currentCall.id, TakeoverRequest(pending.idempotencyKey, pending.expectedCallVersion))
                 store.updatePendingTakeover(null)
                 session = store.read()
 
                 stateBannerView?.text = "Ringing your phone…"
                 takeOverBtn?.text = "Ringing your phone…"
             } catch (error: Exception) {
+                Log.e(TAG, "Takeover request failed: ${error.message}", error)
                 if (error is CancellationException) throw error
                 if (error is ApiException && TakeoverPolicy.definitiveRejection(error.status)) {
                     store.updatePendingTakeover(null)
                     session = store.read()
                 }
+
+                // If 409 conflict, the call version likely incremented during conversation.
+                // Re-fetch call: if still screening with a newer version, auto-retry immediately!
+                if (error is ApiException && error.status == 409) {
+                    try {
+                        val refreshed = api?.call(call.id)?.call
+                        if (refreshed != null && refreshed.state == "screening" && refreshed.version != call.version) {
+                            Log.i(TAG, "Call version advanced from ${call.version} to ${refreshed.version}; auto-retrying takeover...")
+                            selectedCall = refreshed
+                            val retryPending = TakeoverPolicy.prepare(refreshed, null)
+                            store.updatePendingTakeover(retryPending)
+                            session = store.read()
+
+                            val retryResp = api?.takeover(refreshed.id, TakeoverRequest(retryPending.idempotencyKey, retryPending.expectedCallVersion))
+                            store.updatePendingTakeover(null)
+                            session = store.read()
+
+                            stateBannerView?.text = "Ringing your phone…"
+                            takeOverBtn?.text = "Ringing your phone…"
+                            return@launch
+                        }
+                    } catch (retryError: Exception) {
+                        Log.e(TAG, "Auto-retry takeover failed: ${retryError.message}", retryError)
+                    }
+                }
+
                 val reason = when ((error as? ApiException)?.status) {
-                    409 -> "Takeover in progress or already taken."
+                    409 -> error.errorResponse?.message ?: error.errorResponse?.reason ?: "Takeover in progress or already taken."
                     503 -> "Your phone is busy or unavailable."
                     else -> error.message ?: "Takeover request failed."
                 }

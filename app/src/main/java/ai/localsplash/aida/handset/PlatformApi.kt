@@ -83,6 +83,7 @@ class PlatformApi(
             val bodyStr = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 val parsedError = runCatching { json.decodeFromString<AttachErrorResponse>(bodyStr) }.getOrNull()
+                android.util.Log.e("PlatformApi", "${request.method} ${request.url} failed: HTTP ${response.code} body: $bodyStr")
                 throw ApiException(response.code, parsedError, bodyStr)
             }
             bodyStr
