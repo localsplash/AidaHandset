@@ -125,6 +125,8 @@ class MainActivity : Activity() {
                         } else if (selectedCall != null) {
                             handleCallEnded()
                         }
+                    } else if (calls.isNotEmpty()) {
+                        openCall(calls.first())
                     }
                 }
             }
@@ -135,12 +137,18 @@ class MainActivity : Activity() {
         super.onStart()
         foreground = true
         startPolling()
-        selectedCall?.let {
-            if (live.currentCallId != it.id || !live.isConnected) {
-                openCall(it)
+        val targetCall = selectedCall ?: AlertingService.activeCalls.value.firstOrNull()
+        if (targetCall != null) {
+            AlertingService.dismissCallAlert(this)
+            if (live.currentCallId != targetCall.id || !live.isConnected) {
+                openCall(targetCall)
             } else {
-                renderCallScreen(it)
+                renderCallScreen(targetCall)
                 updateTranscriptUI()
+            }
+        } else if (selectedCallId != null) {
+            scope.launch {
+                fetchAndOpenCall(selectedCallId!!)
             }
         }
     }
@@ -398,7 +406,9 @@ class MainActivity : Activity() {
     }
 
     private fun openCall(call: Call, reconnect: Boolean = false) {
-        AlertingService.dismissCallAlert(this)
+        if (foreground) {
+            AlertingService.dismissCallAlert(this)
+        }
         val callChanged = selectedCallId != call.id
         selectedCallId = call.id
         selectedCall = call
@@ -569,7 +579,17 @@ class MainActivity : Activity() {
             visibility = View.GONE
             minHeight = dp(32)
             setPadding(dp(8), dp(2), dp(8), dp(2))
-            setOnClickListener { transcriptScroll?.fullScroll(View.FOCUS_DOWN) }
+            setOnClickListener {
+                autoScroll = true
+                visibility = View.GONE
+                transcriptScroll?.post {
+                    val child = transcriptScroll?.getChildAt(0)
+                    if (child != null && transcriptScroll != null) {
+                        val targetY = (child.bottom - transcriptScroll!!.height).coerceAtLeast(0)
+                        transcriptScroll?.scrollTo(0, targetY)
+                    }
+                }
+            }
         }
         transcriptHeader.addView(jumpToLatestBtn)
         rightPanel.addView(transcriptHeader)
@@ -585,7 +605,6 @@ class MainActivity : Activity() {
             textSize = 16f
             setTextColor(Color.rgb(28, 41, 57))
             setPadding(dp(12), dp(10), dp(12), dp(10))
-            setTextIsSelectable(true)
             setLineSpacing(0f, 1.25f)
             text = "Connecting to Aida…"
         }
@@ -595,7 +614,7 @@ class MainActivity : Activity() {
             setOnScrollChangeListener { _, _, scrollY, _, _ ->
                 val child = getChildAt(0)
                 if (child != null) {
-                    val diff = (child.bottom - (height + scrollY))
+                    val diff = child.bottom - (height + scrollY)
                     autoScroll = diff <= dp(30)
                     jumpToLatestBtn?.visibility = if (autoScroll) View.GONE else View.VISIBLE
                 }
@@ -646,6 +665,7 @@ class MainActivity : Activity() {
     }
 
     private fun executeTakeover(call: Call) {
+        AlertingService.dismissCallAlert(this)
         if (commandJob?.isActive == true) return
         val paired = session ?: return
 
@@ -696,10 +716,14 @@ class MainActivity : Activity() {
         takeOverBtn?.setBackgroundColor(Color.rgb(180, 180, 180))
         takeOverBtn?.text = "Call ended"
         transcriptStateView?.text = "Transcript closed"
+        AlertingService.dismissCallAlert(this)
 
         scope.launch {
             delay(2000)
-            if (selectedCallId == selectedCall?.id) {
+            val remainingCalls = AlertingService.activeCalls.value.filter { it.id != selectedCall?.id }
+            if (remainingCalls.isNotEmpty()) {
+                openCall(remainingCalls.first())
+            } else {
                 selectedCallId = null
                 selectedCall = null
                 reducer = null
@@ -748,7 +772,11 @@ class MainActivity : Activity() {
 
         if (autoScroll) {
             transcriptScroll?.post {
-                transcriptScroll?.fullScroll(View.FOCUS_DOWN)
+                val child = transcriptScroll?.getChildAt(0)
+                if (child != null && transcriptScroll != null) {
+                    val targetY = (child.bottom - transcriptScroll!!.height).coerceAtLeast(0)
+                    transcriptScroll?.scrollTo(0, targetY)
+                }
             }
         }
     }

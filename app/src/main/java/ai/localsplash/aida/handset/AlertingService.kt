@@ -241,7 +241,12 @@ class AlertingService : Service() {
             setTextViewText(R.id.notif_title, "Incoming Aida Call: $caller")
             setTextViewText(R.id.notif_text, "Screening · Tap banner to view transcript")
             setOnClickPendingIntent(R.id.notif_root, fullScreenPendingIntent)
+            setOnClickPendingIntent(R.id.notif_icon, fullScreenPendingIntent)
+            setOnClickPendingIntent(R.id.notif_title, fullScreenPendingIntent)
+            setOnClickPendingIntent(R.id.notif_text, fullScreenPendingIntent)
             setOnClickPendingIntent(R.id.notif_takeover_btn, takeoverPendingIntent)
+            setOnClickPendingIntent(R.id.notif_takeover_icon, takeoverPendingIntent)
+            setOnClickPendingIntent(R.id.notif_takeover_text, takeoverPendingIntent)
         }
 
         val actionTitle = SpannableString("Take Over").apply {
