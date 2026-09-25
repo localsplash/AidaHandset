@@ -367,7 +367,7 @@ class MainActivity : Activity() {
                     statusText.text = if (calls.isEmpty()) "Monitoring queue · No active calls" else "${calls.size} active call(s)"
                 } catch (e: ApiException) {
                     if (e.status == 401 || e.status == 403) {
-                        reAttachSilently()
+                        reAttachSilently(forceFresh = true)
                     }
                 } catch (_: Exception) {}
                 delay(5000)
@@ -375,34 +375,95 @@ class MainActivity : Activity() {
         }
     }
 
-    private suspend fun reAttachSilently() {
-        val s = session ?: return
+    private suspend fun reAttachSilently(forceFresh: Boolean = false): Boolean {
+        if (!forceFresh) {
+            val stored = store.read()
+            if (stored != null && stored.token != session?.token) {
+                session = stored
+                api = PlatformApi(stored.serverUrl, stored.token)
+                Log.i(TAG, "reAttachSilently: Adopted newer session token from SecureSessionStore")
+                return true
+            }
+        }
+
+        val s = session ?: store.read() ?: return false
         val localIps = DeviceIdentifier.getLocalIps()
-        if (localIps.isEmpty()) return
-        try {
+        if (localIps.isEmpty()) return false
+        return try {
             val resp = PlatformApi(s.serverUrl).attach(
                 AttachRequest(
                     appInstanceId = store.appInstanceId,
                     localIps = localIps,
                     deviceModel = DeviceIdentifier.getDeviceModel(),
-                    claimedMac = DeviceIdentifier.getClaimedMac(),
+                    appVersion = BuildConfig.VERSION_NAME,
+                    claimedMac = DeviceIdentifier.getClaimedMac()?.takeIf { it.isNotBlank() },
                 )
             )
             val updated = s.copy(token = resp.token, expiresAt = resp.expiresAt, device = resp.device)
             store.save(updated)
             session = updated
             api = PlatformApi(updated.serverUrl, updated.token)
-        } catch (_: Exception) {}
+            Log.i(TAG, "reAttachSilently succeeded: fresh session token acquired")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "reAttachSilently failed: ${e.message}")
+            false
+        }
+    }
+
+    private suspend fun fetchCallDetail(callId: String): CallDetail? {
+        var currentApi = api
+        if (currentApi == null) {
+            reAttachSilently()
+            currentApi = api ?: return null
+        }
+        return try {
+            currentApi.call(callId)
+        } catch (e: ApiException) {
+            if (e.status == 401 || e.status == 403) {
+                Log.w(TAG, "Session invalid (HTTP ${e.status}) fetching call $callId; re-attaching silently...")
+                val reattached = reAttachSilently()
+                val retryApi = api
+                if (retryApi != null && reattached) {
+                    try {
+                        retryApi.call(callId)
+                    } catch (retryError: ApiException) {
+                        if (retryError.status == 401 || retryError.status == 403) {
+                            Log.w(TAG, "Retry failed with HTTP ${retryError.status}; forcing fresh attach...")
+                            if (reAttachSilently(forceFresh = true)) {
+                                runCatching { api?.call(callId) }.getOrNull()
+                            } else null
+                        } else {
+                            Log.e(TAG, "Retry fetching call $callId failed: ${retryError.message}")
+                            null
+                        }
+                    } catch (retryError: Exception) {
+                        Log.e(TAG, "Retry fetching call $callId failed: ${retryError.message}")
+                        null
+                    }
+                } else {
+                    null
+                }
+            } else {
+                Log.e(TAG, "fetchCallDetail $callId failed: ${e.message}")
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchCallDetail $callId failed: ${e.message}")
+            null
+        }
     }
 
     private suspend fun fetchAndOpenCall(callId: String, shouldTakeover: Boolean = false) {
         try {
-            val detail = api?.call(callId) ?: return
+            val detail = fetchCallDetail(callId) ?: return
             openCall(detail.call)
             if (shouldTakeover) {
                 executeTakeover(detail.call)
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchAndOpenCall error: ${e.message}", e)
+        }
     }
 
     private fun openCall(call: Call, reconnect: Boolean = false) {
@@ -437,7 +498,10 @@ class MainActivity : Activity() {
         loadingCall = scope.launch {
             try {
                 transcriptStateView?.text = "Connecting live transcript…"
-                val detail = api?.call(call.id) ?: return@launch
+                val detail = fetchCallDetail(call.id) ?: run {
+                    transcriptStateView?.text = "Unable to connect transcript."
+                    return@launch
+                }
                 selectedCall = detail.call
                 updateCallState(detail.call)
 
@@ -480,7 +544,7 @@ class MainActivity : Activity() {
                         for (i in 1..10) {
                             delay(1000)
                             if (!isActive || selectedCallId != call.id) break
-                            val refreshed = runCatching { api?.call(call.id) }.getOrNull() ?: continue
+                            val refreshed = fetchCallDetail(call.id) ?: continue
                             val sid = refreshed.agentParticipantSid
                             if (!sid.isNullOrBlank()) {
                                 live.updateAgentParticipantSid(sid)
@@ -664,6 +728,20 @@ class MainActivity : Activity() {
         }
     }
 
+    private suspend fun executeTakeoverApi(callId: String, request: TakeoverRequest): TakeoverResponse? {
+        val currentApi = api ?: return null
+        return try {
+            currentApi.takeover(callId, request)
+        } catch (e: ApiException) {
+            if (e.status == 401 || e.status == 403) {
+                Log.w(TAG, "Takeover returned HTTP ${e.status} for call $callId; re-attaching silently...")
+                if (reAttachSilently(forceFresh = true)) {
+                    api?.takeover(callId, request)
+                } else throw e
+            } else throw e
+        }
+    }
+
     private fun executeTakeover(call: Call) {
         AlertingService.dismissCallAlert(this)
         if (commandJob?.isActive == true) return
@@ -676,7 +754,7 @@ class MainActivity : Activity() {
             try {
                 // Refresh call version directly from the server to avoid sending a stale version from initial alert
                 val currentCall = try {
-                    val refreshed = api?.call(call.id)?.call
+                    val refreshed = fetchCallDetail(call.id)?.call
                     if (refreshed != null) {
                         selectedCall = refreshed
                         refreshed
@@ -699,7 +777,7 @@ class MainActivity : Activity() {
                 session = savedSession
 
                 Log.i(TAG, "Sending takeover request: callId=${currentCall.id}, version=${pending.expectedCallVersion}, key=${pending.idempotencyKey}")
-                val resp = api?.takeover(currentCall.id, TakeoverRequest(pending.idempotencyKey, pending.expectedCallVersion))
+                val resp = executeTakeoverApi(currentCall.id, TakeoverRequest(pending.idempotencyKey, pending.expectedCallVersion))
                 store.updatePendingTakeover(null)
                 session = store.read()
 
@@ -717,7 +795,7 @@ class MainActivity : Activity() {
                 // Re-fetch call: if still screening with a newer version, auto-retry immediately!
                 if (error is ApiException && error.status == 409) {
                     try {
-                        val refreshed = api?.call(call.id)?.call
+                        val refreshed = fetchCallDetail(call.id)?.call
                         if (refreshed != null && refreshed.state == "screening" && refreshed.version != call.version) {
                             Log.i(TAG, "Call version advanced from ${call.version} to ${refreshed.version}; auto-retrying takeover...")
                             selectedCall = refreshed
@@ -725,7 +803,7 @@ class MainActivity : Activity() {
                             store.updatePendingTakeover(retryPending)
                             session = store.read()
 
-                            val retryResp = api?.takeover(refreshed.id, TakeoverRequest(retryPending.idempotencyKey, retryPending.expectedCallVersion))
+                            val retryResp = executeTakeoverApi(refreshed.id, TakeoverRequest(retryPending.idempotencyKey, retryPending.expectedCallVersion))
                             store.updatePendingTakeover(null)
                             session = store.read()
 
