@@ -57,6 +57,11 @@ class PlatformApi(
         return if (response.isBlank() || response == "{}") TakeoverResponse("ringing") else json.decodeFromString(response)
     }
 
+    suspend fun reportSpam(callId: String, reportRequest: ReportSpamRequest): ReportSpamResponse {
+        val response = request(listOf("handset", "calls", callId, "report-spam"), method = "POST", body = json.encodeToString(reportRequest))
+        return if (response.isBlank() || response == "{}") ReportSpamResponse("reported") else json.decodeFromString(response)
+    }
+
     suspend fun logout() {
         request(listOf("handset", "logout"), method = "POST", body = "{}")
     }

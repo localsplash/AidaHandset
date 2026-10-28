@@ -13,7 +13,9 @@ import io.livekit.android.room.Room
 import java.util.Collections
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
@@ -23,6 +25,7 @@ import kotlinx.serialization.json.longOrNull
 
 @OptIn(io.livekit.android.annotations.Beta::class)
 class LiveTranscript(private val context: Context, private val scope: CoroutineScope) {
+    private val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var room: Room? = null
     private var events: Job? = null
     @Volatile private var expectedCallId: String? = null
@@ -35,6 +38,7 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
     private val pendingBuffer = Collections.synchronizedList(mutableListOf<Pair<String?, TranscriptEvent>>())
     private val streamSequenceCounters = Collections.synchronizedMap(mutableMapOf<String, Long>())
     private var onEventCallback: ((TranscriptEvent) -> Unit)? = null
+    private var onCallFunctionCallback: ((String) -> Unit)? = null
 
     private fun nextSequence(streamId: String): Long {
         return synchronized(streamSequenceCounters) {
@@ -51,6 +55,7 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
         agentParticipantSid: String? = null,
         onEvent: (TranscriptEvent) -> Unit,
         onState: (String, Boolean) -> Unit,
+        onCallFunction: ((String) -> Unit)? = null,
     ) {
         val wsUrl = when {
             session.url.startsWith("https://") -> "wss://" + session.url.removePrefix("https://")
@@ -61,6 +66,7 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
         if (expectedCallId == callId && isConnected) {
             Log.i(TAG, "Already connected to callId=$callId, updating callbacks")
             onEventCallback = onEvent
+            onCallFunctionCallback = onCallFunction
             onState("Live transcript connected", false)
             return
         }
@@ -68,6 +74,7 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
         expectedCallId = callId
         boundAgentSid = agentParticipantSid
         onEventCallback = onEvent
+        onCallFunctionCallback = onCallFunction
         pendingBuffer.clear()
         streamSequenceCounters.clear()
 
@@ -142,10 +149,15 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
                         val rawStr = event.data.toString(Charsets.UTF_8)
                         val senderSid = event.participant?.sid?.value
                         Log.i(TAG, "DataReceived from $senderSid topic=${event.topic}: $rawStr")
+                        val callFunc = parseCallFunction(rawStr, event.topic)
+                        if (callFunc != null) {
+                            Log.i(TAG, "LiveKit call function received: $callFunc")
+                            onCallFunctionCallback?.invoke(callFunc)
+                        }
                         val parsed = parseDataPacket(rawStr, expectedCallId)
                         if (parsed != null) {
                             handleDataPacket(senderSid, parsed)
-                        } else {
+                        } else if (callFunc == null) {
                             Log.w(TAG, "Could not parse data packet: $rawStr")
                         }
                     }
@@ -267,21 +279,102 @@ class LiveTranscript(private val context: Context, private val scope: CoroutineS
     fun close() {
         events?.cancel()
         events = null
-        try {
-            room?.disconnect()
-            room?.release()
-        } catch (_: Exception) {}
+        val oldRoom = room
         room = null
         isRoomConnected = false
         expectedCallId = null
         boundAgentSid = null
         onEventCallback = null
+        onCallFunctionCallback = null
         pendingBuffer.clear()
         streamSequenceCounters.clear()
+
+        if (oldRoom != null) {
+            teardownScope.launch {
+                try {
+                    oldRoom.disconnect()
+                    oldRoom.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Exception during background room teardown: ${e.message}")
+                }
+            }
+        }
     }
 
     companion object {
         private const val TAG = "LiveTranscript"
+
+        fun parseCallFunction(raw: String, topic: String? = null): String? {
+            val trimmed = raw.trim()
+            normalizeFunctionValue(trimmed.removeSurrounding("\""))?.let { return it }
+
+            try {
+                val element = PlatformApi.json.parseToJsonElement(trimmed)
+                if (element is JsonObject) {
+                    val directFunc = element["function"]?.jsonPrimitive?.contentOrNull
+                        ?: element["value"]?.jsonPrimitive?.contentOrNull
+                        ?: element["action"]?.jsonPrimitive?.contentOrNull
+                        ?: element["call"]?.jsonPrimitive?.contentOrNull
+
+                    if (directFunc != null) {
+                        normalizeFunctionValue(directFunc)?.let { return it }
+                    }
+
+                    val type = element["type"]?.jsonPrimitive?.contentOrNull
+                    if (type == "call" || type == "function_call") {
+                        val fn = element["name"]?.jsonPrimitive?.contentOrNull
+                            ?: element["function"]?.jsonPrimitive?.contentOrNull
+                        if (fn != null) {
+                            normalizeFunctionValue(fn)?.let { return it }
+                        }
+                    }
+
+                    val argsObj = element["arguments"]
+                    if (argsObj is JsonObject) {
+                        val argVal = argsObj["value"]?.jsonPrimitive?.contentOrNull
+                            ?: argsObj["function"]?.jsonPrimitive?.contentOrNull
+                            ?: argsObj["action"]?.jsonPrimitive?.contentOrNull
+                            ?: argsObj["call"]?.jsonPrimitive?.contentOrNull
+                        if (argVal != null) {
+                            normalizeFunctionValue(argVal)?.let { return it }
+                        }
+                    } else if (argsObj != null && argsObj.jsonPrimitive.isString) {
+                        val rawArgsStr = argsObj.jsonPrimitive.content
+                        if (rawArgsStr.isNotBlank()) {
+                            parseCallFunction(rawArgsStr)?.let { return it }
+                        }
+                    }
+
+                    val nestedFn = element["function"]
+                    if (nestedFn is JsonObject) {
+                        val nestedName = nestedFn["name"]?.jsonPrimitive?.contentOrNull
+                        if (nestedName != null) {
+                            normalizeFunctionValue(nestedName)?.let { return it }
+                        }
+                        val nestedArgs = nestedFn["arguments"]
+                        if (nestedArgs != null) {
+                            val argStr = if (nestedArgs is JsonObject) nestedArgs.toString() else nestedArgs.jsonPrimitive.content
+                            parseCallFunction(argStr)?.let { return it }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+
+            if (topic.equals("call", ignoreCase = true)) {
+                normalizeFunctionValue(trimmed)?.let { return it }
+            }
+
+            return null
+        }
+
+        private fun normalizeFunctionValue(value: String): String? {
+            val v = value.trim().lowercase()
+            return when {
+                v == "human_escalate" || v == "human-escalate" -> "human_escalate"
+                v == "spam_likely" || v == "spam-likely" -> "spam_likely"
+                else -> null
+            }
+        }
     }
 }
 

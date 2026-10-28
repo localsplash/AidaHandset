@@ -73,4 +73,41 @@ class AlertingAndEarlyJoinTest {
         handlePacket("PA_UNKNOWN", eventOther)
         assertEquals(2, received.size)
     }
+
+    @Test
+    fun parseCallFunctionIdentifiesHumanEscalateVariations() {
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("human_escalate"))
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("\"human_escalate\""))
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("""{"type":"call","function":"human_escalate"}"""))
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("""{"type":"call","value":"human_escalate"}"""))
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("""{"call":"human_escalate"}"""))
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("""{"function":"human_escalate"}"""))
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("""{"name":"call","arguments":{"value":"human_escalate"}}"""))
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("""{"name":"call","arguments":{"function":"human_escalate"}}"""))
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("""{"name":"call","arguments":"{\"value\":\"human_escalate\"}"}"""))
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("human_escalate", topic = "call"))
+        assertEquals("human_escalate", LiveTranscript.parseCallFunction("human-escalate"))
+    }
+
+    @Test
+    fun parseCallFunctionIdentifiesSpamLikelyVariations() {
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("spam_likely"))
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("\"spam_likely\""))
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("""{"type":"call","function":"spam_likely"}"""))
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("""{"type":"call","value":"spam_likely"}"""))
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("""{"call":"spam_likely"}"""))
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("""{"function":"spam_likely"}"""))
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("""{"name":"call","arguments":{"value":"spam_likely"}}"""))
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("""{"name":"call","arguments":{"function":"spam_likely"}}"""))
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("""{"name":"call","arguments":"{\"value\":\"spam_likely\"}"}"""))
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("spam_likely", topic = "call"))
+        assertEquals("spam_likely", LiveTranscript.parseCallFunction("spam-likely"))
+    }
+
+    @Test
+    fun parseCallFunctionReturnsNullForOtherMessages() {
+        assertNull(LiveTranscript.parseCallFunction("""{"type":"transcript","text":"hello"}"""))
+        assertNull(LiveTranscript.parseCallFunction("random message"))
+        assertNull(LiveTranscript.parseCallFunction("""{"call":"some_other_function"}"""))
+    }
 }

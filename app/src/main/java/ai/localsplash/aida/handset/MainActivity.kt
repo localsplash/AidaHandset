@@ -1,5 +1,7 @@
 package ai.localsplash.aida.handset
 
+import android.animation.ArgbEvaluator
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
@@ -33,6 +35,7 @@ import kotlinx.coroutines.launch
 class MainActivity : Activity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var store: SecureSessionStore
+    private lateinit var settingsStore: SettingsStore
     private val live = LiveTranscript(this, scope)
     private var session: DeviceSession? = null
     private var api: PlatformApi? = null
@@ -46,6 +49,10 @@ class MainActivity : Activity() {
     private var foreground = false
     private var autoScroll = true
     private val callStartTimes = mutableMapOf<String, Long>()
+    private val spamLikelyCalls = mutableSetOf<String>()
+    private val escalatedCalls = mutableSetOf<String>()
+    private var isShowingSettings = false
+    private var takeOverFlashingAnimator: ValueAnimator? = null
 
     // UI elements
     private lateinit var rootContainer: LinearLayout
@@ -53,19 +60,21 @@ class MainActivity : Activity() {
     private lateinit var callsTabs: LinearLayout
     private lateinit var tabsScroll: HorizontalScrollView
     private lateinit var detailContainer: LinearLayout
-    private var detachBtn: Button? = null
+    private var settingsBtn: Button? = null
     private var transcriptScroll: ScrollView? = null
     private var transcriptView: TextView? = null
     private var transcriptStateView: TextView? = null
     private var gapNoticeView: TextView? = null
     private var jumpToLatestBtn: Button? = null
     private var takeOverBtn: Button? = null
+    private var reportSpamBtn: Button? = null
     private var stateBannerView: TextView? = null
     private var chronometerView: Chronometer? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = SecureSessionStore(this)
+        settingsStore = SettingsStore(this)
         AlertingService.start(this)
 
         session = store.read()
@@ -107,9 +116,10 @@ class MainActivity : Activity() {
     private fun observeIncomingAlerts() {
         scope.launch {
             AlertingService.incomingAlertCall.collect { callId ->
-                if (selectedCallId == null) {
-                    selectedCallId = callId
-                    fetchAndOpenCall(callId)
+                if (settingsStore.automaticMonitor || selectedCallId == null) {
+                    if (selectedCallId != callId) {
+                        fetchAndOpenCall(callId)
+                    }
                 }
             }
         }
@@ -125,8 +135,10 @@ class MainActivity : Activity() {
                         } else if (selectedCall != null) {
                             handleCallEnded()
                         }
-                    } else if (calls.isNotEmpty()) {
-                        openCall(calls.first())
+                    } else if (calls.isNotEmpty() && !isShowingSettings) {
+                        if (settingsStore.automaticMonitor) {
+                            openCall(calls.first())
+                        }
                     }
                 }
             }
@@ -161,6 +173,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         scope.cancel()
+        stopTakeoverFlashing()
         live.close()
         super.onDestroy()
     }
@@ -258,17 +271,23 @@ class MainActivity : Activity() {
         val extLabel = "${getString(R.string.app_name)}  ·  Ext ${currentSession.device.extension} (${currentSession.device.context})"
         header.addView(label(extLabel, 18f).apply { setTypeface(null, Typeface.BOLD) }, LinearLayout.LayoutParams(0, -2, 1f))
 
-        detachBtn = Button(this).apply {
-            text = "Unpair phone"
-            textSize = 12f
-            setTextColor(Color.rgb(130, 140, 150))
+        settingsBtn = Button(this).apply {
+            text = "⚙ Settings"
+            textSize = 13f
+            setTextColor(Color.rgb(71, 85, 105))
             setBackgroundColor(Color.TRANSPARENT)
             setPadding(dp(8), dp(4), dp(8), dp(4))
             minHeight = dp(32)
             isAllCaps = false
-            setOnClickListener { showDetachConfirmation() }
+            setOnClickListener {
+                if (isShowingSettings) {
+                    exitSettings()
+                } else {
+                    renderSettingsScreen()
+                }
+            }
         }
-        header.addView(detachBtn)
+        header.addView(settingsBtn)
         rootContainer.addView(header)
 
         statusText = label("Connected. Waiting for calls…", 13f).apply {
@@ -314,7 +333,7 @@ class MainActivity : Activity() {
             setTextColor(Color.rgb(148, 163, 184))
         })
         detailContainer.addView(idleLayout, LinearLayout.LayoutParams(-1, -1))
-        detachBtn?.visibility = View.VISIBLE
+        settingsBtn?.visibility = View.VISIBLE
         statusText.visibility = View.VISIBLE
     }
 
@@ -471,6 +490,10 @@ class MainActivity : Activity() {
             AlertingService.dismissCallAlert(this)
         }
         val callChanged = selectedCallId != call.id
+        if (callChanged) {
+            stopTakeoverFlashing()
+        }
+        isShowingSettings = false
         selectedCallId = call.id
         selectedCall = call
 
@@ -511,11 +534,12 @@ class MainActivity : Activity() {
                     return@launch
                 }
 
+                val initialSid = detail.effectiveAgentParticipantSid
                 // Join room early
                 live.connect(
                     callId = call.id,
                     session = livekit,
-                    agentParticipantSid = detail.agentParticipantSid,
+                    agentParticipantSid = initialSid,
                     onEvent = { event ->
                         Log.i(TAG, "onEvent received: speaker=${event.speaker} seq=${event.sequence} text='${event.text}'")
                         if (selectedCallId == call.id) {
@@ -536,16 +560,23 @@ class MainActivity : Activity() {
                             }
                         }
                     },
+                    onCallFunction = { func ->
+                        if (selectedCallId == call.id) {
+                            runOnUiThread {
+                                handleLiveKitCallFunction(func)
+                            }
+                        }
+                    },
                 )
 
                 // If agentParticipantSid is not yet known, poll call detail every 1s for up to 10s
-                if (detail.agentParticipantSid.isNullOrBlank()) {
+                if (initialSid.isNullOrBlank()) {
                     earlyJoinJob = launch {
                         for (i in 1..10) {
                             delay(1000)
                             if (!isActive || selectedCallId != call.id) break
                             val refreshed = fetchCallDetail(call.id) ?: continue
-                            val sid = refreshed.agentParticipantSid
+                            val sid = refreshed.effectiveAgentParticipantSid
                             if (!sid.isNullOrBlank()) {
                                 live.updateAgentParticipantSid(sid)
                                 break
@@ -561,9 +592,10 @@ class MainActivity : Activity() {
     }
 
     private fun renderCallScreen(call: Call) {
+        isShowingSettings = false
         detailContainer.removeAllViews()
         detailContainer.orientation = LinearLayout.HORIZONTAL
-        detachBtn?.visibility = View.GONE
+        settingsBtn?.visibility = View.VISIBLE
         statusText.visibility = View.GONE
 
         // Left panel: Call details & Takeover button (width: 240dp)
@@ -620,6 +652,26 @@ class MainActivity : Activity() {
             setOnClickListener { executeTakeover(call) }
         }
         leftPanel.addView(takeOverBtn, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(4), 0, 0) })
+
+        // Report Spam Button
+        reportSpamBtn = Button(this).apply {
+            text = "Report Spam"
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            minHeight = dp(46)
+            setBackgroundColor(Color.rgb(185, 28, 28))
+            setTextColor(Color.WHITE)
+            isAllCaps = false
+            visibility = if (spamLikelyCalls.contains(call.id)) View.VISIBLE else View.GONE
+            setOnClickListener { executeReportSpam(call) }
+        }
+        leftPanel.addView(reportSpamBtn, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(8), 0, 0) })
+
+        if (escalatedCalls.contains(call.id)) {
+            startTakeoverFlashing()
+        } else {
+            stopTakeoverFlashing()
+        }
 
         // Right panel: Live Transcript (weight: 1f, full available height)
         val rightPanel = LinearLayout(this).apply {
@@ -696,27 +748,47 @@ class MainActivity : Activity() {
     private fun updateCallState(call: Call) {
         selectedCall = call
         val state = call.state
+        if (state != "screening") {
+            stopTakeoverFlashing()
+        }
         stateBannerView?.text = "State: $state"
         when (state) {
             "screening" -> {
-                stateBannerView?.setBackgroundColor(Color.rgb(230, 240, 255))
+                if (escalatedCalls.contains(call.id)) {
+                    stateBannerView?.text = "ESCALATION: Human assistance requested!"
+                    stateBannerView?.setBackgroundColor(Color.rgb(254, 226, 226))
+                    stateBannerView?.setTextColor(Color.rgb(185, 28, 28))
+                    startTakeoverFlashing()
+                } else if (spamLikelyCalls.contains(call.id)) {
+                    stateBannerView?.text = "Suspected Spam Call"
+                    stateBannerView?.setBackgroundColor(Color.rgb(254, 243, 199))
+                    stateBannerView?.setTextColor(Color.rgb(180, 83, 9))
+                } else {
+                    stateBannerView?.setBackgroundColor(Color.rgb(230, 240, 255))
+                    stateBannerView?.setTextColor(Color.rgb(30, 64, 175))
+                }
                 takeOverBtn?.isEnabled = commandJob?.isActive != true
                 takeOverBtn?.setBackgroundColor(Color.rgb(46, 125, 50))
                 takeOverBtn?.text = "Take over"
+                reportSpamBtn?.visibility = if (spamLikelyCalls.contains(call.id)) View.VISIBLE else View.GONE
             }
             "ringing" -> {
                 stateBannerView?.setBackgroundColor(Color.rgb(255, 245, 200))
+                stateBannerView?.setTextColor(Color.rgb(30, 64, 175))
                 stateBannerView?.text = "Ringing your phone…"
                 takeOverBtn?.isEnabled = false
                 takeOverBtn?.setBackgroundColor(Color.rgb(120, 120, 120))
                 takeOverBtn?.text = "Ringing your phone…"
+                reportSpamBtn?.visibility = View.GONE
             }
             "human-active" -> {
                 stateBannerView?.setBackgroundColor(Color.rgb(220, 255, 220))
+                stateBannerView?.setTextColor(Color.rgb(30, 64, 175))
                 stateBannerView?.text = "Connected — pick up the handset"
                 takeOverBtn?.isEnabled = false
                 takeOverBtn?.setBackgroundColor(Color.rgb(120, 120, 120))
                 takeOverBtn?.text = "Connected"
+                reportSpamBtn?.visibility = View.GONE
                 scope.launch {
                     delay(3000)
                     handleCallEnded()
@@ -743,6 +815,7 @@ class MainActivity : Activity() {
     }
 
     private fun executeTakeover(call: Call) {
+        stopTakeoverFlashing()
         AlertingService.dismissCallAlert(this)
         if (commandJob?.isActive == true) return
         val paired = session ?: return
@@ -829,14 +902,49 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun executeReportSpam(call: Call) {
+        reportSpamBtn?.isEnabled = false
+        reportSpamBtn?.text = "Reporting spam…"
+        takeOverBtn?.isEnabled = false
+        stopTakeoverFlashing()
+        stateBannerView?.text = "Spam reported · Ending call…"
+        stateBannerView?.setBackgroundColor(Color.rgb(254, 226, 226))
+        stateBannerView?.setTextColor(Color.rgb(185, 28, 28))
+
+        scope.launch {
+            try {
+                api?.reportSpam(
+                    call.id,
+                    ReportSpamRequest(
+                        callId = call.id,
+                        callerNumber = call.callerNumber,
+                        reason = "spam_likely",
+                        terminateCall = true
+                    )
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Report spam API error: ${e.message}")
+            }
+            delay(500)
+            handleCallEnded()
+        }
+    }
+
     private fun handleCallEnded() {
+        stopTakeoverFlashing()
         loadingCall?.cancel()
         earlyJoinJob?.cancel()
         live.close()
         chronometerView?.stop()
-        selectedCall?.id?.let { callStartTimes.remove(it) }
+        selectedCall?.id?.let {
+            callStartTimes.remove(it)
+            spamLikelyCalls.remove(it)
+            escalatedCalls.remove(it)
+        }
+        reportSpamBtn?.visibility = View.GONE
         stateBannerView?.text = "Call ended"
         stateBannerView?.setBackgroundColor(Color.rgb(240, 240, 240))
+        stateBannerView?.setTextColor(Color.rgb(100, 116, 139))
         takeOverBtn?.isEnabled = false
         takeOverBtn?.setBackgroundColor(Color.rgb(180, 180, 180))
         takeOverBtn?.text = "Call ended"
@@ -846,9 +954,9 @@ class MainActivity : Activity() {
         scope.launch {
             delay(2000)
             val remainingCalls = AlertingService.activeCalls.value.filter { it.id != selectedCall?.id }
-            if (remainingCalls.isNotEmpty()) {
+            if (remainingCalls.isNotEmpty() && !isShowingSettings) {
                 openCall(remainingCalls.first())
-            } else {
+            } else if (!isShowingSettings) {
                 selectedCallId = null
                 selectedCall = null
                 reducer = null
@@ -919,6 +1027,217 @@ class MainActivity : Activity() {
             reducer = null
             live.close()
             attemptAttach()
+        }
+    }
+
+    private fun handleLiveKitCallFunction(func: String) {
+        val call = selectedCall ?: return
+        Log.i(TAG, "handleLiveKitCallFunction: func=$func, callId=${call.id}")
+        when (func) {
+            "human_escalate" -> {
+                escalatedCalls.add(call.id)
+                SoundAlert.playChime(this)
+                startTakeoverFlashing()
+                stateBannerView?.text = "ESCALATION: Human assistance requested!"
+                stateBannerView?.setBackgroundColor(Color.rgb(254, 226, 226))
+                stateBannerView?.setTextColor(Color.rgb(185, 28, 28))
+            }
+            "spam_likely" -> {
+                spamLikelyCalls.add(call.id)
+                reportSpamBtn?.visibility = View.VISIBLE
+                stateBannerView?.text = "Suspected Spam Call"
+                stateBannerView?.setBackgroundColor(Color.rgb(254, 243, 199))
+                stateBannerView?.setTextColor(Color.rgb(180, 83, 9))
+            }
+        }
+    }
+
+    private fun startTakeoverFlashing() {
+        runOnUiThread {
+            if (takeOverFlashingAnimator != null) return@runOnUiThread
+            val btn = takeOverBtn ?: return@runOnUiThread
+            val normalGreen = Color.rgb(46, 125, 50)
+            val alertRed = Color.rgb(220, 38, 38)
+            takeOverFlashingAnimator = ValueAnimator.ofObject(ArgbEvaluator(), normalGreen, alertRed).apply {
+                duration = 450
+                repeatCount = ValueAnimator.INFINITE
+                repeatMode = ValueAnimator.REVERSE
+                addUpdateListener { anim ->
+                    btn.setBackgroundColor(anim.animatedValue as Int)
+                }
+                start()
+            }
+        }
+    }
+
+    private fun stopTakeoverFlashing() {
+        runOnUiThread {
+            takeOverFlashingAnimator?.cancel()
+            takeOverFlashingAnimator = null
+            takeOverBtn?.setBackgroundColor(Color.rgb(46, 125, 50))
+        }
+    }
+
+    private fun renderSettingsScreen() {
+        isShowingSettings = true
+        detailContainer.removeAllViews()
+        detailContainer.orientation = LinearLayout.VERTICAL
+
+        val currentSession = session
+        val currentDevice = currentSession?.device
+
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(24))
+        }
+
+        // Top bar: Settings title + Back button
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        topBar.addView(label("Settings", 22f).apply {
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.rgb(15, 23, 42))
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+
+        val backBtn = Button(this).apply {
+            text = "← Back to Monitor"
+            textSize = 13f
+            isAllCaps = false
+            setBackgroundColor(Color.rgb(226, 232, 240))
+            setTextColor(Color.rgb(30, 41, 59))
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            minHeight = dp(36)
+            setOnClickListener { exitSettings() }
+        }
+        topBar.addView(backBtn)
+        content.addView(topBar)
+
+        content.addView(createDivider())
+
+        // Preferences Section
+        content.addView(label("Call Monitoring", 16f).apply {
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.rgb(30, 64, 175))
+        })
+
+        val autoMonitorRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val autoMonitorText = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        autoMonitorText.addView(label("Automatic Monitor", 15f).apply {
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.rgb(15, 23, 42))
+        })
+        autoMonitorText.addView(label("Automatically open live transcription monitor on inbound calls rather than merely showing the notification banner.", 12f).apply {
+            setTextColor(Color.rgb(100, 116, 139))
+        })
+        autoMonitorRow.addView(autoMonitorText, LinearLayout.LayoutParams(0, -2, 1f))
+
+        val autoSwitch = android.widget.Switch(this).apply {
+            isChecked = settingsStore.automaticMonitor
+            setOnCheckedChangeListener { _, isChecked ->
+                settingsStore.automaticMonitor = isChecked
+                Log.i(TAG, "Automatic Monitor setting set to $isChecked")
+            }
+        }
+        autoMonitorRow.addView(autoSwitch)
+        content.addView(autoMonitorRow)
+
+        content.addView(createDivider())
+
+        // Phone Identification Section
+        content.addView(label("Phone Identification", 16f).apply {
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.rgb(30, 64, 175))
+        })
+
+        val localIps = DeviceIdentifier.getLocalIps().joinToString(", ").ifEmpty { "None detected" }
+        val claimedMac = DeviceIdentifier.getClaimedMac() ?: "Unavailable"
+        val model = DeviceIdentifier.getDeviceModel()
+
+        content.addView(createInfoRow("Extension", currentDevice?.extension ?: "Not paired"))
+        content.addView(createInfoRow("Context", currentDevice?.context ?: "None"))
+        content.addView(createInfoRow("PBX Instance ID", currentDevice?.pbxInstanceId ?: "None"))
+        content.addView(createInfoRow("Endpoint ID", currentDevice?.endpointId ?: "None"))
+        content.addView(createInfoRow("Device Model", model))
+        content.addView(createInfoRow("Local IP(s)", localIps))
+        content.addView(createInfoRow("Claimed MAC", claimedMac))
+        content.addView(createInfoRow("Server URL", currentSession?.serverUrl ?: "Default"))
+        content.addView(createInfoRow("App Instance ID", store.appInstanceId))
+        content.addView(createInfoRow("App Version", "${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})"))
+
+        content.addView(createDivider())
+
+        // Device Connection & Detach
+        content.addView(label("Device Connection", 16f).apply {
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.rgb(30, 64, 175))
+        })
+
+        val unpairLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(6), 0, dp(12))
+        }
+        unpairLayout.addView(label("Unpairing this phone will disconnect Ext ${currentDevice?.extension ?: ""} and stop receiving call alerts until re-identified.", 12f).apply {
+            setTextColor(Color.rgb(100, 116, 139))
+        })
+
+        val unpairBtn = Button(this).apply {
+            text = "Unpair phone"
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.rgb(185, 28, 28))
+            setBackgroundColor(Color.rgb(254, 226, 226))
+            isAllCaps = false
+            minHeight = dp(44)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            setOnClickListener { showDetachConfirmation() }
+        }
+        unpairLayout.addView(unpairBtn, LinearLayout.LayoutParams(-2, -2).apply { setMargins(0, dp(8), 0, 0) })
+        content.addView(unpairLayout)
+
+        scroll.addView(content)
+        detailContainer.addView(scroll, LinearLayout.LayoutParams(-1, -1))
+    }
+
+    private fun exitSettings() {
+        isShowingSettings = false
+        val call = selectedCall
+        if (call != null) {
+            renderCallScreen(call)
+            updateTranscriptUI()
+        } else {
+            renderIdleScreen()
+        }
+    }
+
+    private fun createInfoRow(title: String, value: String): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(4), 0, dp(4))
+            addView(label(title, 13f).apply {
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(Color.rgb(71, 85, 105))
+            }, LinearLayout.LayoutParams(dp(140), -2))
+            addView(label(value, 13f).apply {
+                setTextColor(Color.rgb(15, 23, 42))
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+    }
+
+    private fun createDivider(): View {
+        return View(this).apply {
+            setBackgroundColor(Color.rgb(226, 232, 240))
+            layoutParams = LinearLayout.LayoutParams(-1, dp(1)).apply {
+                setMargins(0, dp(8), 0, dp(8))
+            }
         }
     }
 

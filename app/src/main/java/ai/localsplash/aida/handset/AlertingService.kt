@@ -209,6 +209,18 @@ class AlertingService : Service() {
         val call = activeCalls.value.firstOrNull { it.id == callSessionId }
         incomingAlertCall.tryEmit(callSessionId)
         showFullScreenAlertNotification(callSessionId, call?.callerNumber ?: "Incoming Call")
+
+        if (SettingsStore(this).automaticMonitor) {
+            val monitorIntent = Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra("EXTRA_CALL_ID", callSessionId)
+            }
+            try {
+                startActivity(monitorIntent)
+            } catch (e: Exception) {
+                android.util.Log.w("AlertingService", "Could not start MainActivity for automatic monitor: ${e.message}")
+            }
+        }
     }
 
     private fun showFullScreenAlertNotification(callId: String, caller: String) {
