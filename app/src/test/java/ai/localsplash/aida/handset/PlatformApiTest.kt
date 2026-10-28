@@ -191,4 +191,44 @@ class PlatformApiTest {
             TakeoverPolicy.prepare(Call("call-2", "screening", 1, "support"), pending)
         }
     }
+
+    @Test fun reportSpamSendsCorrectPayload() = runBlocking {
+        server.enqueue(MockResponse().setBody("""{"status":"reported","terminated":true,"message":"Spam recorded"}"""))
+        val resp = api("auth-token").reportSpam(
+            "call-42",
+            ReportSpamRequest(
+                callId = "call-42",
+                callerNumber = "+15551234567",
+                reason = "spam_likely",
+                blockCaller = true,
+                terminateCall = true
+            )
+        )
+        assertEquals("reported", resp.status)
+        assertTrue(resp.terminated)
+        assertEquals("Spam recorded", resp.message)
+
+        val request = server.takeRequest()
+        assertEquals("/v1/handset/calls/call-42/report-spam", request.path)
+        assertEquals("POST", request.method)
+        assertEquals("Bearer auth-token", request.getHeader("Authorization"))
+
+        val body = PlatformApi.json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals("call-42", body["callId"]!!.jsonPrimitive.content)
+        assertEquals("+15551234567", body["callerNumber"]!!.jsonPrimitive.content)
+        assertEquals("spam_likely", body["reason"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun callDetailHydratesAgentParticipantSidFromCallDto() = runBlocking {
+        server.enqueue(
+            MockResponse().setBody(
+                """{"call":{"id":"call-nested-sid","state":"screening","version":1,"queue":"support","agentParticipantSid":"PA_NESTED_456"},"livekit":{"url":"wss://livekit.example.test","token":"jwt-token"}}"""
+            )
+        )
+        val api = api("secret-token")
+        val detail = api.call("call-nested-sid")
+        assertNull(detail.agentParticipantSid)
+        assertEquals("PA_NESTED_456", detail.call.agentParticipantSid)
+        assertEquals("PA_NESTED_456", detail.effectiveAgentParticipantSid)
+    }
 }

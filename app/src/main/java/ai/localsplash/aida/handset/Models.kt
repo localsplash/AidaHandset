@@ -73,6 +73,7 @@ data class Call(
     val queue: String,
     val callerNumber: String? = null,
     val startedAt: String? = null,
+    val agentParticipantSid: String? = null,
 )
 
 @Serializable
@@ -100,7 +101,10 @@ data class CallDetail(
     val agentParticipantSid: String? = null,
     val takeover: TakeoverInfo? = null,
     val livekit: LiveKitSession? = null,
-)
+) {
+    val effectiveAgentParticipantSid: String?
+        get() = agentParticipantSid?.takeIf { it.isNotBlank() } ?: call.agentParticipantSid?.takeIf { it.isNotBlank() }
+}
 
 @Serializable
 data class TakeoverRequest(
@@ -150,4 +154,20 @@ data class TranscriptEvent(
     val isFinal: Boolean = false,
     val timestamp: String = "",
     val speaker: String? = null,
+)
+
+@Serializable
+data class ReportSpamRequest(
+    val callId: String,
+    val callerNumber: String? = null,
+    val reason: String = "spam_likely",
+    val blockCaller: Boolean = true,
+    val terminateCall: Boolean = true,
+)
+
+@Serializable
+data class ReportSpamResponse(
+    val status: String = "reported",
+    val terminated: Boolean = true,
+    val message: String? = null,
 )
